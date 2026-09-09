@@ -6,6 +6,7 @@ def test_normalize_balance_cents():
     assert out["cash_cents"] == 12500
     assert out["portfolio_value_cents"] == 3400
     assert out["equity_cents"] == 15900
+    assert out["shard_balances_cents"] == {}
 
 
 def test_normalize_positions_filters_zero():

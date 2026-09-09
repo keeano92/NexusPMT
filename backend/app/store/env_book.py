@@ -29,6 +29,8 @@ class EnvBook:
     live_portfolio_value_cents: int | None = None
     live_equity_cents: int | None = None
     live_realized_pnl_cents: int = 0
+    # Per Kalshi exchange shard cash (cents). Orders must use a funded shard.
+    live_shard_balances_cents: dict[int, int] = field(default_factory=dict)
     portfolio_source: str = "paper"
     portfolio_updated_ts: str | None = None
 

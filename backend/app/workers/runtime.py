@@ -7,9 +7,19 @@ import logging
 import uuid
 from typing import Any
 
-from backend.app.kalshi.client import KalshiClient
+from backend.app.kalshi.client import (
+    KalshiAPIError,
+    KalshiClient,
+    classify_kalshi_error,
+    is_soft_order_reject,
+)
 from backend.app.kalshi.models import EdgeCandidate, OrderIntent
-from backend.app.kalshi.portfolio import normalize_balance, normalize_positions
+from backend.app.kalshi.portfolio import (
+    funded_exchange_indexes,
+    normalize_balance,
+    normalize_positions,
+    shard_cash_cents,
+)
 from backend.app.state import AppState
 from backend.app.timeutil import local_iso
 from backend.app.workers.edge_engine import score_edges
@@ -28,6 +38,8 @@ def _iso() -> str:
 
 
 def _friendly_kalshi_error(exc: Exception) -> str:
+    if isinstance(exc, KalshiAPIError):
+        return exc.friendly()
     text = str(exc)
     if "410" in text and "Gone" in text:
         return (
@@ -38,6 +50,8 @@ def _friendly_kalshi_error(exc: Exception) -> str:
         return "Kalshi auth failed (401) — check key/env match (demo keys ≠ production)"
     if "429" in text:
         return "Kalshi rate limited (429) — backing off"
+    if "insufficient" in text.lower() and "balance" in text.lower():
+        return "Kalshi insufficient_balance — no cash on that exchange shard"
     if "400" in text:
         return f"Kalshi rejected order (400): {text[:180]}"
     # Keep short for ledger readability
@@ -56,6 +70,7 @@ class AutonomyRuntime:
         self._recent_trades: dict[str, float] = {}  # ticker -> unix ts
         self._recent_evals: dict[str, float] = {}
         self._last_block_log_ts: float = 0.0
+        self._soft_reject_cycle: bool = False
 
     async def start(self) -> None:
         s = self.state.settings
@@ -393,6 +408,24 @@ class AutonomyRuntime:
             self.state.failsafes.record_api_error()
             return
 
+        shards = dict(self.state.book().live_shard_balances_cents or {})
+        funded = funded_exchange_indexes(shards, min_cents=1)
+        # Live books with known breakdown: only evaluate markets we can fund.
+        # If breakdown missing (paper / first sync), do not filter yet.
+        funded_filter: set[int] | None = funded if (
+            s.kalshi_trading_mode == "live" and shards
+        ) else None
+        if funded_filter is not None:
+            self.state.terminal(
+                f"SHARDS funded={sorted(funded_filter)} "
+                f"cash={{{', '.join(f'{i}:{shards.get(i, 0)}¢' for i in sorted(shards))}}}"
+            )
+            if not funded_filter:
+                self.state.terminal("SCAN skip — no funded exchange shards (all cash=0)")
+                self.state.edges = []
+                await self.state.publish({"type": "edges", "edges": [], "scanned_at": _iso()})
+                return
+
         candidates = collect_candidate_markets(
             markets,
             series_by,
@@ -400,8 +433,14 @@ class AutonomyRuntime:
             max_spread=s.kalshi_max_spread,
             min_liquidity=s.kalshi_min_liquidity,
             limit=max(6, int(s.kalshi_eval_batch_size) * 2),
+            funded_shards=funded_filter,
         )
-        self.state.terminal(f"SCAN {len(markets)} open → {len(candidates)} fundamental candidates")
+        shard_note = (
+            f" on shards {sorted(funded_filter)}" if funded_filter is not None else ""
+        )
+        self.state.terminal(
+            f"SCAN {len(markets)} open → {len(candidates)} fundamental candidates{shard_note}"
+        )
         if not candidates:
             self.state.edges = []
             self.state.evaluations = []
@@ -459,6 +498,8 @@ class AutonomyRuntime:
                     liquidity=cand.get("liquidity"),
                     action="buy_yes" if verdict.side == "yes" else "buy_no",
                 ).model_dump()
+                if cand.get("exchange_index") is not None:
+                    edge_row["exchange_index"] = cand.get("exchange_index")
                 enter_edges.append(edge_row)
                 self.state.edges = list(enter_edges)
             else:
@@ -543,8 +584,9 @@ class AutonomyRuntime:
                     open_count = len(self.state.positions)
                     room = max(0, int(self.state.settings.kalshi_max_open_positions) - open_count)
                     placed = 0
+                    self._soft_reject_cycle = False
                     for edge in self.state.edges:
-                        if placed >= max_n or placed >= room:
+                        if placed >= max_n or placed >= room or self._soft_reject_cycle:
                             break
                         did = await self._maybe_trade(edge)
                         if did:
@@ -592,12 +634,33 @@ class AutonomyRuntime:
             )
             return False
 
-        # Strong wheel/xAI entries: allocate ~90% of this env book's available cash.
+        # Strong wheel/xAI entries: allocate ~90% of cash on the market's exchange shard.
         # yes_price is always the YES-book limit (cents). Buying NO = ask YES at that price.
         yes_price = int(round(float(edge.get("market_prob", 0.5)) * 100))
         yes_price = min(99, max(1, yes_price))
         pay_cents = yes_price if edge.get("side") != "no" else max(1, 100 - yes_price)
-        cash = max(0, self.state.book().cash_cents())
+
+        ex_raw = edge.get("exchange_index")
+        try:
+            exchange_index = int(ex_raw) if ex_raw is not None else None
+        except (TypeError, ValueError):
+            exchange_index = None
+
+        shards = dict(self.state.book().live_shard_balances_cents or {})
+        if s.kalshi_trading_mode == "live" and shards:
+            if exchange_index is None:
+                self.state.terminal(f"SKIP {ticker} — missing exchange_index (cannot route shard)")
+                return False
+            cash = max(0, shard_cash_cents(shards, exchange_index))
+            if cash <= 0:
+                self.state.terminal(
+                    f"SKIP {ticker} — shard {exchange_index} unfunded "
+                    f"(funded={sorted(funded_exchange_indexes(shards))})"
+                )
+                return False
+        else:
+            cash = max(0, self.state.book().cash_cents())
+
         alloc = int(cash * float(s.kalshi_strong_allocation_pct))
         if alloc <= 0:
             self.state.terminal(f"SKIP {ticker} — no cash in book {self.state.active_book_key}")
@@ -605,8 +668,9 @@ class AutonomyRuntime:
         count = max(1, alloc // pay_cents)
         count = min(count, max(1, cash // pay_cents))
         notional = pay_cents * count
+        shard_tag = f" shard={exchange_index}" if exchange_index is not None else ""
         self.state.terminal(
-            f"SIZE {ticker} {edge.get('side')} cash={cash}¢ alloc={alloc}¢ "
+            f"SIZE {ticker} {edge.get('side')}{shard_tag} cash={cash}¢ alloc={alloc}¢ "
             f"yes_px={yes_price}¢ pay={pay_cents}¢ qty={count} notional={notional}¢"
         )
 
@@ -619,7 +683,11 @@ class AutonomyRuntime:
             mode=s.kalshi_trading_mode,
             edge=edge.get("edge"),
             reason="futures_wheel_edge",
-            meta={"wheel_driven": True, "category": edge.get("category")},
+            meta={
+                "wheel_driven": True,
+                "category": edge.get("category"),
+                "exchange_index": exchange_index,
+            },
         )
 
         if (
@@ -663,6 +731,7 @@ class AutonomyRuntime:
                 count=intent.count,
                 yes_price_cents=int(intent.yes_price or 50),
                 client_order_id=coid,
+                exchange_index=exchange_index,
             )
             resp = await self._kalshi.create_order(body)
             oid = (resp or {}).get("order_id") if isinstance(resp, dict) else None
@@ -674,7 +743,11 @@ class AutonomyRuntime:
                 price_cents=intent.yes_price,
                 mode="live",
                 status="submitted",
-                message=f"Live order submitted (V2){f' id={oid}' if oid else ''}",
+                message=(
+                    f"Live order submitted (V2)"
+                    f"{f' id={oid}' if oid else ''}"
+                    f"{f' shard={exchange_index}' if exchange_index is not None else ''}"
+                ),
                 meta={"response": resp, "edge": edge.get("edge"), "request": body},
             )
             self.state.failsafes.record_api_success()
@@ -683,8 +756,29 @@ class AutonomyRuntime:
             await self.state.publish({"type": "ledger"})
             return True
         except Exception as exc:
-            self.state.failsafes.record_api_error()
             friendly = _friendly_kalshi_error(exc)
+            soft = is_soft_order_reject(exc)
+            kind = classify_kalshi_error(exc)
+            if soft:
+                # Business rejects (wrong shard / no cash / closed market / 429)
+                # must NOT trip error_streak auto-kill.
+                self._soft_reject_cycle = True
+                self._recent_trades[ticker] = time.time()
+                status = "soft_reject"
+                self.state.terminal(f"SOFT REJECT {ticker}: {friendly}")
+            else:
+                self.state.failsafes.record_api_error()
+                status = "error"
+                self.state.terminal(f"ORDER ERROR {ticker}: {friendly}")
+            meta: dict[str, Any] = {
+                "error": str(exc),
+                "classify": kind,
+                "exchange_index": exchange_index,
+            }
+            if isinstance(exc, KalshiAPIError):
+                meta["kalshi_code"] = exc.code
+                meta["kalshi_status"] = exc.status_code
+                meta["kalshi_body"] = exc.body
             self.state.ledger.append(
                 kind="order",
                 ticker=ticker,
@@ -692,11 +786,10 @@ class AutonomyRuntime:
                 qty=intent.count,
                 price_cents=intent.yes_price,
                 mode="live",
-                status="error",
+                status=status,
                 message=friendly,
-                meta={"error": str(exc)},
+                meta=meta,
             )
-            self.state.terminal(f"ORDER ERROR {ticker}: {friendly}")
             await self.state.publish({"type": "ledger"})
             return False
 
@@ -747,6 +840,9 @@ class AutonomyRuntime:
             self.state.live_portfolio_value_cents = norms["portfolio_value_cents"]
             self.state.live_equity_cents = norms["equity_cents"]
             self.state.live_realized_pnl_cents = realized
+            self.state.book().live_shard_balances_cents = dict(
+                norms.get("shard_balances_cents") or {}
+            )
             self.state.positions = positions
             self.state.portfolio_source = "live"
             self.state.portfolio_updated_ts = _iso()

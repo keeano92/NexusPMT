@@ -83,8 +83,13 @@ def collect_candidate_markets(
     max_spread: float,
     min_liquidity: float,
     limit: int = 12,
+    funded_shards: set[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Pick liquid fundamental open markets as evaluation candidates."""
+    """Pick liquid fundamental open markets as evaluation candidates.
+
+    When ``funded_shards`` is set, only markets whose ``exchange_index`` is in
+    that set are kept — cash on Kalshi is per-shard and cannot fund other shards.
+    """
     out: list[dict[str, Any]] = []
     for market in markets:
         ticker = str(market.get("ticker") or "")
@@ -99,6 +104,14 @@ def collect_candidate_markets(
             continue
         if not market_filter.allow_market(market, series):
             continue
+        ex_raw = market.get("exchange_index")
+        try:
+            exchange_index = int(ex_raw) if ex_raw is not None else None
+        except (TypeError, ValueError):
+            exchange_index = None
+        if funded_shards is not None:
+            if exchange_index is None or exchange_index not in funded_shards:
+                continue
         mid = _mid_prob(market)
         if mid is None or mid <= 0.02 or mid >= 0.98:
             continue
@@ -121,6 +134,7 @@ def collect_candidate_markets(
                 "market_prob": mid,
                 "spread": spread,
                 "liquidity": liq,
+                "exchange_index": exchange_index,
                 "raw": market,
             }
         )

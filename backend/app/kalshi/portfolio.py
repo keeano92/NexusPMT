@@ -31,8 +31,54 @@ def _fp_count(value: Any) -> float:
         return 0.0
 
 
-def normalize_balance(payload: dict[str, Any]) -> dict[str, int]:
-    """Kalshi GET /portfolio/balance → cash + portfolio_value + equity (cents)."""
+def _parse_shard_balances(payload: dict[str, Any]) -> dict[int, int]:
+    """Parse balance_breakdown → {exchange_index: cash_cents}."""
+    raw = payload.get("balance_breakdown") or []
+    out: dict[int, int] = {}
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("exchange_index"))
+        except (TypeError, ValueError):
+            continue
+        # IndexedBalance.balance is a fixed-point dollar string
+        if "balance" in item and item.get("balance") is not None:
+            bal = item.get("balance")
+            if isinstance(bal, int):
+                # Ambiguous: treat large ints as cents, else dollars
+                cents = bal if abs(bal) >= 100 else _dollars_to_cents(bal)
+            else:
+                cents = _dollars_to_cents(bal)
+        elif item.get("balance_dollars") is not None:
+            cents = _dollars_to_cents(item.get("balance_dollars"))
+        else:
+            cents = 0
+        out[idx] = cents
+    return out
+
+
+def funded_exchange_indexes(
+    shard_balances_cents: dict[int, int] | None,
+    *,
+    min_cents: int = 1,
+) -> set[int]:
+    """Exchange shards with at least min_cents available cash."""
+    if not shard_balances_cents:
+        return set()
+    return {idx for idx, cents in shard_balances_cents.items() if int(cents) >= int(min_cents)}
+
+
+def shard_cash_cents(shard_balances_cents: dict[int, int] | None, exchange_index: int | None) -> int:
+    if exchange_index is None or not shard_balances_cents:
+        return 0
+    return int(shard_balances_cents.get(int(exchange_index), 0))
+
+
+def normalize_balance(payload: dict[str, Any]) -> dict[str, Any]:
+    """Kalshi GET /portfolio/balance → cash + portfolio_value + equity + shards (cents)."""
     cash = int(payload.get("balance") or 0)
     # Prefer explicit cents field; fall back to dollars string
     if "balance" not in payload and payload.get("balance_dollars") is not None:
@@ -44,12 +90,15 @@ def normalize_balance(payload: dict[str, Any]) -> dict[str, int]:
     else:
         port_cents = int(port or 0)
 
+    shard_balances = _parse_shard_balances(payload)
+
     # Total account equity ≈ available cash + mark of open positions
     equity = cash + port_cents
     return {
         "cash_cents": cash,
         "portfolio_value_cents": port_cents,
         "equity_cents": equity,
+        "shard_balances_cents": shard_balances,
     }
 
 
@@ -80,16 +129,20 @@ def normalize_positions(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         realized_total += realized_cents
 
         avg_price = int(round(exposure_cents / qty)) if qty else 0
-        out.append(
-            {
-                "ticker": p.get("ticker") or p.get("market_ticker"),
-                "qty": qty,
-                "side": side,
-                "avg_price_cents": abs(avg_price),
-                "exposure_cents": exposure_cents,
-                "realized_pnl_cents": realized_cents,
-                "source": "live",
-                "raw_position_fp": qty_fp,
-            }
-        )
+        pos: dict[str, Any] = {
+            "ticker": p.get("ticker") or p.get("market_ticker"),
+            "qty": qty,
+            "side": side,
+            "avg_price_cents": abs(avg_price),
+            "exposure_cents": exposure_cents,
+            "realized_pnl_cents": realized_cents,
+            "source": "live",
+            "raw_position_fp": qty_fp,
+        }
+        if p.get("exchange_index") is not None:
+            try:
+                pos["exchange_index"] = int(p.get("exchange_index"))
+            except (TypeError, ValueError):
+                pass
+        out.append(pos)
     return out, realized_total
