@@ -90,10 +90,20 @@
     el.className = "daily" + (v < 0 ? " neg" : "");
   }
 
-  function renderEdges(edges) {
+  function renderEdges(edges, scannedAt) {
     const body = $("edgeBody");
     body.innerHTML = "";
-    (edges || []).forEach((e) => {
+    const list = edges || [];
+    if ($("oppHint")) {
+      $("oppHint").textContent = list.length
+        ? `Wheel → edge scores · ${list.length} opportunities · auto-trade top picks${scannedAt ? " · " + scannedAt : ""}`
+        : "Waiting for Futures Wheel + Kalshi scan…";
+    }
+    if (!list.length) {
+      body.innerHTML = "<tr><td colspan='6'>No fundamental edges yet</td></tr>";
+      return;
+    }
+    list.forEach((e) => {
       const tr = document.createElement("tr");
       tr.innerHTML = `<td>${e.ticker}</td><td>${e.category || ""}</td><td>${(e.market_prob * 100).toFixed(1)}%</td>
         <td>${(e.model_prob * 100).toFixed(1)}%</td><td>${(e.edge * 100).toFixed(1)}%</td><td>${e.action}</td>`;
@@ -115,10 +125,29 @@
 
   function renderPortfolio(snap) {
     const root = $("portfolio");
-    const cash = money(snap.paper_cash_cents);
+    const source = (snap.portfolio_source || "paper").toUpperCase();
+    const cash = money(snap.cash_cents != null ? snap.cash_cents : snap.paper_cash_cents);
+    const equity = snap.live_equity_cents != null ? money(snap.live_equity_cents) : null;
+    const posVal = snap.live_portfolio_value_cents != null ? money(snap.live_portfolio_value_cents) : null;
+    const realized = snap.live_realized_pnl_cents != null ? money(snap.live_realized_pnl_cents) : null;
     const positions = snap.positions || [];
-    root.innerHTML = `<div class="item">Cash: <strong>${cash}</strong></div>` +
-      positions.map((p) => `<div class="item">${p.ticker} · qty ${p.qty} · avg ${p.avg_price_cents}¢ · ${p.side}</div>`).join("");
+    let html = `<div class="item"><strong>SOURCE: ${source}</strong>${snap.portfolio_updated_ts ? " · " + snap.portfolio_updated_ts : ""}</div>`;
+    html += `<div class="item">Cash: <strong>${cash}</strong></div>`;
+    if (source === "LIVE") {
+      if (posVal) html += `<div class="item">Positions value: <strong>${posVal}</strong></div>`;
+      if (equity) html += `<div class="item">Equity: <strong>${equity}</strong></div>`;
+      if (realized) html += `<div class="item">Realized PnL: <strong>${realized}</strong></div>`;
+    }
+    if (!positions.length) {
+      html += `<div class="item">No open positions</div>`;
+    } else {
+      html += positions.map((p) => {
+        const extra = p.exposure_cents != null ? ` · exp ${money(p.exposure_cents)}` : "";
+        const rpnl = p.realized_pnl_cents != null ? ` · rPnL ${money(p.realized_pnl_cents)}` : "";
+        return `<div class="item">${p.ticker} · ${p.side} × ${p.qty} · avg ${p.avg_price_cents ?? "—"}¢${extra}${rpnl}</div>`;
+      }).join("");
+    }
+    root.innerHTML = html;
   }
 
   function updateChart() {
@@ -211,6 +240,10 @@
     const data = await control("/api/controls/refresh-wheel");
     if (data && data.ok) alert("Wheel refreshed: " + data.nodes + " nodes (" + (data.model || "?") + ")");
   };
+  $("btnRefreshPortfolio").onclick = async () => {
+    const data = await control("/api/controls/refresh-portfolio");
+    if (data && data.ok === false) alert(data.error || "Portfolio refresh failed");
+  };
   $("btnApplyMode").onclick = async () => {
     const trading_mode = $("selMode").value;
     const kalshi_env = $("selEnv").value;
@@ -249,7 +282,8 @@
         pnlData = msg.pnl || pnlData;
         updateChart();
       } else if (msg.type === "wheel") renderWheel(msg.nodes);
-      else if (msg.type === "edges") renderEdges(msg.edges);
+      else if (msg.type === "edges") renderEdges(msg.edges, msg.scanned_at);
+      else if (msg.type === "portfolio") refresh();
       else if (msg.type === "worldmap") {
         if (msg.worldmap_ready === false || msg.worldmap_ready === true) {
           refresh();

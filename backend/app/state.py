@@ -31,6 +31,13 @@ class AppState:
     last_ingest_ts: str | None = None
     paper_cash_cents: int = 100_000  # $1000 paper starting cash
     paper_positions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Live Kalshi portfolio (authoritative when trading_mode=live)
+    live_cash_cents: int | None = None
+    live_portfolio_value_cents: int | None = None
+    live_equity_cents: int | None = None
+    live_realized_pnl_cents: int = 0
+    portfolio_source: str = "paper"  # paper | live
+    portfolio_updated_ts: str | None = None
     bus_subscribers: set[asyncio.Queue] = field(default_factory=set)
 
     def set_worldmap_ready(self, ready: bool, reason: str = "") -> None:
@@ -83,6 +90,17 @@ class AppState:
             "worldmap_block_reason": self.worldmap_block_reason,
             "last_ingest_ts": self.last_ingest_ts,
             "paper_cash_cents": self.paper_cash_cents,
+            "portfolio_source": self.portfolio_source,
+            "cash_cents": (
+                self.live_cash_cents
+                if self.portfolio_source == "live" and self.live_cash_cents is not None
+                else self.paper_cash_cents
+            ),
+            "live_cash_cents": self.live_cash_cents,
+            "live_portfolio_value_cents": self.live_portfolio_value_cents,
+            "live_equity_cents": self.live_equity_cents,
+            "live_realized_pnl_cents": self.live_realized_pnl_cents,
+            "portfolio_updated_ts": self.portfolio_updated_ts,
         }
 
 

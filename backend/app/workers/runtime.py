@@ -10,6 +10,7 @@ from typing import Any
 
 from backend.app.kalshi.client import KalshiClient
 from backend.app.kalshi.models import OrderIntent
+from backend.app.kalshi.portfolio import normalize_balance, normalize_positions
 from backend.app.state import AppState
 from backend.app.workers.edge_engine import score_edges
 from backend.app.workers.futures_wheel import FuturesWheelEngine
@@ -30,6 +31,7 @@ class AutonomyRuntime:
         self._kalshi: KalshiClient | None = None
         self._wheel: FuturesWheelEngine | None = None
         self._stop = asyncio.Event()
+        self._recent_trades: dict[str, float] = {}  # ticker -> unix ts
 
     async def start(self) -> None:
         s = self.state.settings
@@ -58,8 +60,10 @@ class AutonomyRuntime:
 
         # Seed paper equity
         self.state.pnl.record(self.state.paper_cash_cents)
+        self.state.portfolio_source = "paper"
         self._tasks = [
             asyncio.create_task(self._ingest_loop(), name="ingest"),
+            asyncio.create_task(self._opportunity_loop(), name="opportunities"),
             asyncio.create_task(self._trade_loop(), name="trade"),
             asyncio.create_task(self._pnl_heartbeat(), name="pnl"),
         ]
@@ -244,7 +248,40 @@ class AutonomyRuntime:
         self.state.edges = [e.model_dump() for e in edges]
         await self.state.publish({"type": "edges", "edges": self.state.edges})
 
+    async def _opportunity_loop(self) -> None:
+        """Continuously re-score Kalshi markets against the latest Futures Wheel."""
+        while not self._stop.is_set():
+            try:
+                if self.state.worldmap_ready and self.state.wheel_nodes:
+                    from backend.app.workers.futures_wheel import WheelNode
+
+                    nodes = []
+                    for raw in self.state.wheel_nodes:
+                        try:
+                            nodes.append(WheelNode.model_validate(raw))
+                        except Exception:
+                            continue
+                    if nodes:
+                        await self._refresh_edges(nodes)
+                        await self.state.publish(
+                            {
+                                "type": "edges",
+                                "edges": self.state.edges,
+                                "scanned_at": _iso(),
+                            }
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("opportunity scan error")
+            interval = max(15.0, float(self.state.settings.kalshi_opportunity_scan_sec))
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+
     async def _trade_loop(self) -> None:
+        """Auto-place trades from top Futures-Wheel-ranked Kalshi opportunities."""
         while not self._stop.is_set():
             try:
                 if (
@@ -252,42 +289,77 @@ class AutonomyRuntime:
                     and self.state.failsafes.can_place_orders()
                     and self.state.edges
                 ):
-                    await self._maybe_trade(self.state.edges[0])
+                    max_n = max(1, int(self.state.settings.kalshi_max_trades_per_cycle))
+                    open_count = len(self.state.positions)
+                    room = max(0, int(self.state.settings.kalshi_max_open_positions) - open_count)
+                    placed = 0
+                    for edge in self.state.edges:
+                        if placed >= max_n or placed >= room:
+                            break
+                        did = await self._maybe_trade(edge)
+                        if did:
+                            placed += 1
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("trade loop error")
+            interval = max(5.0, float(self.state.settings.kalshi_trade_interval_sec))
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=15)
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 pass
 
-    async def _maybe_trade(self, edge: dict[str, Any]) -> None:
+    def _trade_cooldown_ok(self, ticker: str, cooldown_sec: float = 300.0) -> bool:
+        import time
+
+        last = self._recent_trades.get(ticker)
+        now = time.time()
+        if last is not None and (now - last) < cooldown_sec:
+            return False
+        return True
+
+    async def _maybe_trade(self, edge: dict[str, Any]) -> bool:
         s = self.state.settings
         if s.worldmap_required and not self.state.worldmap_ready:
-            return
+            return False
         if edge.get("action") == "skip":
-            return
-        ticker = edge["ticker"]
-        if not self.state.market_filter.allow_market({"ticker": ticker, "title": edge.get("title"), "category": edge.get("category")}):
+            return False
+        ticker = str(edge.get("ticker") or "")
+        if not ticker:
+            return False
+        if not self._trade_cooldown_ok(ticker):
+            return False
+        if any(str(p.get("ticker")) == ticker for p in self.state.positions):
+            return False
+        if not self.state.market_filter.allow_market(
+            {"ticker": ticker, "title": edge.get("title"), "category": edge.get("category")}
+        ):
             self.state.ledger.append(
                 kind="filter",
                 ticker=ticker,
                 status="blocked",
                 message="Sports/non-fundamental market blocked",
             )
-            return
+            return False
 
-        notional = min(100, s.kalshi_max_notional_cents)
+        count = max(1, int(s.kalshi_contract_count))
+        yes_price = int(round(float(edge.get("market_prob", 0.5)) * 100))
+        yes_price = min(99, max(1, yes_price))
+        notional = yes_price * count
+        if notional > s.kalshi_max_notional_cents:
+            count = max(1, s.kalshi_max_notional_cents // max(1, yes_price))
+            notional = yes_price * count
+
         intent = OrderIntent(
             ticker=ticker,
             side=edge["side"],
-            count=1,
-            yes_price=int(round(float(edge.get("market_prob", 0.5)) * 100)),
+            count=count,
+            yes_price=yes_price,
             client_order_id=f"nx-{uuid.uuid4().hex[:12]}",
             mode=s.kalshi_trading_mode,
             edge=edge.get("edge"),
-            reason="autonomous_edge",
+            reason="futures_wheel_edge",
+            meta={"wheel_driven": True, "category": edge.get("category")},
         )
 
         if (
@@ -303,51 +375,61 @@ class AutonomyRuntime:
                 price_cents=intent.yes_price,
                 mode="live",
                 status="pending_approval",
-                message="Awaiting operator approval",
+                message="Awaiting operator approval (above notional gate)",
                 meta=intent.model_dump(),
             )
             await self.state.publish({"type": "ledger"})
-            return
+            return False
 
         if not self.state.failsafes.can_place_orders():
-            return
+            return False
+
+        import time
 
         if s.kalshi_trading_mode == "paper" or not self._kalshi:
             await self._paper_fill(intent, edge)
-        else:
-            try:
-                body = {
-                    "ticker": intent.ticker,
-                    "side": intent.side,
-                    "action": "buy",
-                    "count": intent.count,
-                    "type": "limit",
-                    "yes_price": intent.yes_price,
-                    "client_order_id": intent.client_order_id,
-                }
-                resp = await self._kalshi.create_order(body)
-                self.state.ledger.append(
-                    kind="order",
-                    ticker=ticker,
-                    side=intent.side,
-                    qty=intent.count,
-                    price_cents=intent.yes_price,
-                    mode="live",
-                    status="submitted",
-                    message="Live order submitted",
-                    meta={"response": resp},
-                )
-                self.state.failsafes.record_api_success()
-            except Exception as exc:
-                self.state.failsafes.record_api_error()
-                self.state.ledger.append(
-                    kind="order",
-                    ticker=ticker,
-                    mode="live",
-                    status="error",
-                    message=str(exc),
-                )
-        await self.state.publish({"type": "ledger"})
+            self._recent_trades[ticker] = time.time()
+            await self.state.publish({"type": "ledger"})
+            return True
+
+        try:
+            body = {
+                "ticker": intent.ticker,
+                "side": intent.side,
+                "action": "buy",
+                "count": intent.count,
+                "type": "limit",
+                "yes_price": intent.yes_price,
+                "client_order_id": intent.client_order_id,
+            }
+            resp = await self._kalshi.create_order(body)
+            self.state.ledger.append(
+                kind="order",
+                ticker=ticker,
+                side=intent.side,
+                qty=intent.count,
+                price_cents=intent.yes_price,
+                mode="live",
+                status="submitted",
+                message="Live order submitted (wheel-driven)",
+                meta={"response": resp, "edge": edge.get("edge")},
+            )
+            self.state.failsafes.record_api_success()
+            self._recent_trades[ticker] = time.time()
+            await self.sync_live_portfolio()
+            await self.state.publish({"type": "ledger"})
+            return True
+        except Exception as exc:
+            self.state.failsafes.record_api_error()
+            self.state.ledger.append(
+                kind="order",
+                ticker=ticker,
+                mode="live",
+                status="error",
+                message=str(exc),
+            )
+            await self.state.publish({"type": "ledger"})
+            return False
 
     async def _paper_fill(self, intent: OrderIntent, edge: dict[str, Any]) -> None:
         price = intent.yes_price or 50
@@ -363,10 +445,10 @@ class AutonomyRuntime:
         pos["avg_price_cents"] = price
         pos["side"] = intent.side
         self.state.paper_positions[intent.ticker] = pos
+        self.state.portfolio_source = "paper"
         self.state.positions = list(self.state.paper_positions.values())
-        equity = self.state.paper_cash_cents + sum(
-            int(p["qty"]) * int(p["avg_price_cents"]) for p in self.state.paper_positions.values()
-        )
+        self.state.portfolio_updated_ts = _iso()
+        equity = self._paper_equity_cents()
         self.state.pnl.record(equity, realized_pnl_cents=self.state.pnl.daily_pnl_cents())
         self.state.failsafes.update_equity(equity)
         self.state.ledger.append(
@@ -377,19 +459,71 @@ class AutonomyRuntime:
             price_cents=price,
             mode="paper",
             status="filled",
-            message=f"Paper fill edge={edge.get('edge')}",
+            message=f"Paper fill edge={edge.get('edge')} (wheel-driven)",
             meta=intent.model_dump(),
+        )
+        await self.state.publish({"type": "portfolio", "portfolio_source": "paper", "positions": self.state.positions})
+
+    async def sync_live_portfolio(self) -> dict[str, Any]:
+        """Pull authoritative cash/positions from Kalshi when live (or on demand)."""
+        if not self._kalshi:
+            return {"ok": False, "error": "Kalshi client not initialized"}
+        try:
+            bal = await self._kalshi.get_balance()
+            pos_payload = await self._kalshi.get_positions()
+            norms = normalize_balance(bal if isinstance(bal, dict) else {})
+            positions, realized = normalize_positions(pos_payload if isinstance(pos_payload, dict) else {})
+
+            self.state.live_cash_cents = norms["cash_cents"]
+            self.state.live_portfolio_value_cents = norms["portfolio_value_cents"]
+            self.state.live_equity_cents = norms["equity_cents"]
+            self.state.live_realized_pnl_cents = realized
+            self.state.positions = positions
+            self.state.portfolio_source = "live"
+            self.state.portfolio_updated_ts = _iso()
+
+            self.state.pnl.record(
+                norms["equity_cents"],
+                realized_pnl_cents=realized,
+            )
+            self.state.failsafes.update_equity(norms["equity_cents"])
+            self.state.failsafes.record_api_success()
+            await self.state.publish(
+                {
+                    "type": "portfolio",
+                    "portfolio_source": "live",
+                    "cash_cents": norms["cash_cents"],
+                    "live_equity_cents": norms["equity_cents"],
+                    "positions": positions,
+                }
+            )
+            return {"ok": True, **norms, "positions": len(positions), "realized_pnl_cents": realized}
+        except Exception as exc:
+            logger.exception("live portfolio sync failed")
+            self.state.failsafes.record_api_error()
+            return {"ok": False, "error": str(exc)}
+
+    def _paper_equity_cents(self) -> int:
+        return self.state.paper_cash_cents + sum(
+            int(p.get("qty", 0)) * int(p.get("avg_price_cents", 0))
+            for p in self.state.paper_positions.values()
         )
 
     async def _pnl_heartbeat(self) -> None:
+        ticks = 0
         while not self._stop.is_set():
-            equity = self.state.paper_cash_cents + sum(
-                int(p.get("qty", 0)) * int(p.get("avg_price_cents", 0))
-                for p in self.state.paper_positions.values()
-            )
-            self.state.pnl.record(equity)
-            self.state.failsafes.update_equity(equity)
-            await self.state.publish({"type": "pnl", "pnl": self.state.pnl.all_horizons()})
+            s = self.state.settings
+            if s.kalshi_trading_mode == "live" and self._kalshi is not None:
+                # Sync from Kalshi every tick while live so UI matches the exchange
+                await self.sync_live_portfolio()
+            else:
+                self.state.portfolio_source = "paper"
+                self.state.positions = list(self.state.paper_positions.values())
+                equity = self._paper_equity_cents()
+                self.state.pnl.record(equity)
+                self.state.failsafes.update_equity(equity)
+                await self.state.publish({"type": "pnl", "pnl": self.state.pnl.all_horizons()})
+            ticks += 1
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=5)
             except asyncio.TimeoutError:
@@ -454,6 +588,17 @@ class AutonomyRuntime:
                 f"env {prev_env}->{s.kalshi_env}"
             ),
         )
+
+        portfolio_sync: dict[str, Any] | None = None
+        if s.kalshi_trading_mode == "live":
+            portfolio_sync = await self.sync_live_portfolio()
+        else:
+            self.state.portfolio_source = "paper"
+            self.state.positions = list(self.state.paper_positions.values())
+            equity = self._paper_equity_cents()
+            self.state.pnl.record(equity)
+            await self.state.publish({"type": "portfolio", "portfolio_source": "paper"})
+
         await self.state.publish(
             {
                 "type": "trading_config",
@@ -467,8 +612,8 @@ class AutonomyRuntime:
             "kalshi_env": s.kalshi_env,
             "kalshi_base_url": s.kalshi_base_url,
             "previous": {"trading_mode": prev_mode, "kalshi_env": prev_env},
+            "portfolio_sync": portfolio_sync,
         }
-
     async def force_wheel_refresh(self) -> dict[str, Any]:
         """Operator-triggered Futures Wheel rebuild from latest intel."""
         if not self._wheel:

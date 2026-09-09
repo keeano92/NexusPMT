@@ -195,3 +195,31 @@ async def refresh_wheel(
         meta=result,
     )
     return result
+
+
+@router.post("/refresh-portfolio")
+async def refresh_portfolio(
+    request: Request,
+    actor: str = Depends(require_operator),
+) -> dict:
+    runtime = request.app.state.runtime
+    state = request.app.state.state
+    if state.settings.kalshi_trading_mode == "live":
+        result = await runtime.sync_live_portfolio()
+    else:
+        state.portfolio_source = "paper"
+        state.positions = list(state.paper_positions.values())
+        result = {
+            "ok": True,
+            "portfolio_source": "paper",
+            "cash_cents": state.paper_cash_cents,
+            "positions": len(state.positions),
+        }
+        await state.publish({"type": "portfolio", "portfolio_source": "paper"})
+    state.ledger.append(
+        kind="control",
+        status="refresh_portfolio",
+        message=f"Portfolio refresh by {actor}: ok={result.get('ok')}",
+        meta=result,
+    )
+    return result

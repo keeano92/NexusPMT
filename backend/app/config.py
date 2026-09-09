@@ -74,6 +74,10 @@ class Settings(BaseSettings):
         default=1000,
         alias="KALSHI_REQUIRE_APPROVAL_ABOVE_CENTS",
     )
+    kalshi_trade_interval_sec: float = Field(default=20.0, alias="KALSHI_TRADE_INTERVAL_SEC")
+    kalshi_max_trades_per_cycle: int = Field(default=3, alias="KALSHI_MAX_TRADES_PER_CYCLE")
+    kalshi_opportunity_scan_sec: float = Field(default=45.0, alias="KALSHI_OPPORTUNITY_SCAN_SEC")
+    kalshi_contract_count: int = Field(default=1, alias="KALSHI_CONTRACT_COUNT")
 
     xai_api_key: str = Field(default="", alias="XAI_API_KEY")
     xai_base_url: str = Field(default="https://api.x.ai/v1", alias="XAI_BASE_URL")
