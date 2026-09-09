@@ -222,14 +222,29 @@ class AutonomyRuntime:
         series_by: dict[str, dict[str, Any]] = {}
         if self._kalshi:
             try:
-                for cat in list(self.state.settings.allowlist)[:6]:
-                    series_resp = await self._kalshi.list_series(category=cat.title() if cat.islower() else cat)
+                cats = [
+                    c.strip()
+                    for c in self.state.settings.kalshi_category_allowlist.split(",")
+                    if c.strip()
+                ]
+                for cat in cats[:6]:
+                    series_resp = await self._kalshi.list_series(category=cat)
                     for s in series_resp.get("series") or []:
                         if self.state.market_filter.allow_series(s):
                             series_by[str(s.get("ticker"))] = s
-                # Pull open markets (public)
-                mresp = await self._kalshi.list_markets(status="open", limit=200)
-                markets = list(mresp.get("markets") or [])
+                for st in list(series_by.keys())[:25]:
+                    try:
+                        mresp = await self._kalshi.list_markets(
+                            status="open", series_ticker=st, limit=20, mve_filter="exclude"
+                        )
+                    except Exception:
+                        mresp = await self._kalshi.list_markets(
+                            status="open", series_ticker=st, limit=20
+                        )
+                    for mkt in mresp.get("markets") or []:
+                        if not mkt.get("series_ticker"):
+                            mkt = {**mkt, "series_ticker": st}
+                        markets.append(mkt)
             except Exception:
                 logger.exception("Kalshi market pull failed")
                 self.state.failsafes.record_api_error()
@@ -293,13 +308,68 @@ class AutonomyRuntime:
         markets: list[dict[str, Any]] = []
         try:
             cats = [c.strip() for c in s.kalshi_category_allowlist.split(",") if c.strip()]
-            for cat in cats[:8]:
-                series_resp = await self._kalshi.list_series(category=cat)
-                for ser in series_resp.get("series") or []:
-                    if self.state.market_filter.allow_series(ser):
-                        series_by[str(ser.get("ticker"))] = ser
-            mresp = await self._kalshi.list_markets(status="open", limit=200)
-            markets = list(mresp.get("markets") or [])
+            ranked_series: list[dict[str, Any]] = []
+            for cat in cats[:6]:
+                try:
+                    series_resp = await self._kalshi.list_series(
+                        category=cat, include_volume="true"
+                    )
+                except Exception:
+                    series_resp = await self._kalshi.list_series(category=cat)
+                cat_series = [
+                    ser
+                    for ser in (series_resp.get("series") or [])
+                    if self.state.market_filter.allow_series(ser)
+                ]
+
+                def _vol(ser: dict[str, Any]) -> float:
+                    for k in ("volume_fp", "volume", "open_interest"):
+                        try:
+                            return float(ser.get(k) or 0)
+                        except (TypeError, ValueError):
+                            continue
+                    return 0.0
+
+                cat_series.sort(key=_vol, reverse=True)
+                for ser in cat_series[:4]:
+                    series_by[str(ser.get("ticker"))] = ser
+                    ranked_series.append(ser)
+                await asyncio.sleep(0.15)
+
+            # Pull markets only for top series (avoid 429 + empty MVE dump)
+            seen: set[str] = set()
+            for ser in ranked_series[:18]:
+                st = str(ser.get("ticker") or "")
+                if not st:
+                    continue
+                try:
+                    mresp = await self._kalshi.list_markets(
+                        status="open",
+                        series_ticker=st,
+                        limit=20,
+                        mve_filter="exclude",
+                    )
+                except Exception:
+                    try:
+                        mresp = await self._kalshi.list_markets(
+                            status="open", series_ticker=st, limit=20
+                        )
+                    except Exception as exc:
+                        self.state.terminal(f"WARN markets {st}: {exc}")
+                        await asyncio.sleep(0.5)
+                        continue
+                for mkt in mresp.get("markets") or []:
+                    t = str(mkt.get("ticker") or "")
+                    if not t or t in seen or "MVE" in t.upper():
+                        continue
+                    if not mkt.get("series_ticker"):
+                        mkt = {**mkt, "series_ticker": st}
+                    seen.add(t)
+                    markets.append(mkt)
+                await asyncio.sleep(0.2)
+            self.state.terminal(
+                f"PULL series={len(series_by)} markets={len(markets)} (fundamentals only)"
+            )
         except Exception as exc:
             self.state.terminal(f"ERROR Kalshi market pull failed: {exc}")
             self.state.failsafes.record_api_error()

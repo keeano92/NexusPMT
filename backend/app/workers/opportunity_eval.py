@@ -86,26 +86,33 @@ def collect_candidate_markets(
     """Pick liquid fundamental open markets as evaluation candidates."""
     out: list[dict[str, Any]] = []
     for market in markets:
+        ticker = str(market.get("ticker") or "")
+        # Skip multivariate combo markets — noisy and usually empty books
+        if "MVE" in ticker.upper() or market.get("mve_collection_ticker"):
+            continue
         series = series_by.get(str(market.get("series_ticker") or "")) or series_by.get(
             str(market.get("event_ticker") or "").rsplit("-", 1)[0]
         )
+        # Prefer markets we can attribute to an allowlisted series
+        if series is None and series_by:
+            continue
         if not market_filter.allow_market(market, series):
             continue
         mid = _mid_prob(market)
         if mid is None or mid <= 0.02 or mid >= 0.98:
             continue
         spread = _spread(market)
+        # Empty book often reports spread 0 with 0/0 — already excluded by mid
         if spread is not None and spread > max_spread:
             continue
-        # Soft liquidity: allow unknown liquidity through with a floor of 0
         liq = _liquidity(market)
-        if liq > 0 and liq < min_liquidity:
+        if min_liquidity > 0 and liq < min_liquidity:
             continue
         out.append(
             {
                 "ticker": market.get("ticker"),
                 "event_ticker": market.get("event_ticker"),
-                "series_ticker": market.get("series_ticker"),
+                "series_ticker": market.get("series_ticker") or (series or {}).get("ticker"),
                 "title": market.get("title") or market.get("yes_sub_title"),
                 "yes_sub_title": market.get("yes_sub_title"),
                 "no_sub_title": market.get("no_sub_title"),
@@ -116,11 +123,9 @@ def collect_candidate_markets(
                 "raw": market,
             }
         )
-        if len(out) >= limit:
-            break
     # Prefer mid-range probs (more interesting)
     out.sort(key=lambda m: abs(float(m["market_prob"]) - 0.5))
-    return out
+    return out[:limit]
 
 
 class OpportunityEvaluator:

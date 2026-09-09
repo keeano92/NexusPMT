@@ -26,13 +26,22 @@ def _mid_prob(market: dict[str, Any]) -> float | None:
             continue
         if b > 1.0 or a > 1.0:
             b, a = b / 100.0, a / 100.0
+        # Uncrossed / empty book → try last trade
+        if a <= 0 and b <= 0:
+            continue
         if a < b:
             continue
+        if a == 0 and b > 0:
+            return b
+        if b == 0 and a > 0:
+            return a
         return (b + a) / 2.0
     last = market.get("last_price") or market.get("last_price_dollars")
     if last is not None:
         try:
             v = float(last)
+            if v <= 0:
+                return None
             return v / 100.0 if v > 1.0 else v
         except (TypeError, ValueError):
             return None
