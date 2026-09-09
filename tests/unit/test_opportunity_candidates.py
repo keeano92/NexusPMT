@@ -2,7 +2,7 @@ from backend.app.kalshi.market_filter import MarketFilter
 from backend.app.workers.opportunity_eval import collect_candidate_markets
 
 
-def test_collect_candidates_prefers_non_micro_over_15m():
+def test_collect_candidates_can_demote_15m_when_not_preferred():
     mf = MarketFilter.from_settings(["crypto"], ["sports"], strict=True)
     markets = [
         {
@@ -36,7 +36,13 @@ def test_collect_candidates_prefers_non_micro_over_15m():
         },
     }
     out = collect_candidate_markets(
-        markets, series, mf, max_spread=0.1, min_liquidity=0, funded_shards={2}
+        markets,
+        series,
+        mf,
+        max_spread=0.1,
+        min_liquidity=0,
+        funded_shards={2},
+        prefer_micro=False,
     )
     assert out[0]["ticker"] == "BTCMAX-1"
     assert out[0]["micro_horizon"] is False

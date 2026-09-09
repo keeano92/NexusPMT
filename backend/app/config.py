@@ -74,13 +74,24 @@ class Settings(BaseSettings):
         default=50000,
         alias="KALSHI_REQUIRE_APPROVAL_ABOVE_CENTS",
     )
-    kalshi_trade_interval_sec: float = Field(default=20.0, alias="KALSHI_TRADE_INTERVAL_SEC")
-    kalshi_max_trades_per_cycle: int = Field(default=3, alias="KALSHI_MAX_TRADES_PER_CYCLE")
-    kalshi_opportunity_scan_sec: float = Field(default=45.0, alias="KALSHI_OPPORTUNITY_SCAN_SEC")
+    kalshi_trade_interval_sec: float = Field(default=8.0, alias="KALSHI_TRADE_INTERVAL_SEC")
+    kalshi_max_trades_per_cycle: int = Field(default=2, alias="KALSHI_MAX_TRADES_PER_CYCLE")
+    kalshi_opportunity_scan_sec: float = Field(default=12.0, alias="KALSHI_OPPORTUNITY_SCAN_SEC")
     kalshi_contract_count: int = Field(default=1, alias="KALSHI_CONTRACT_COUNT")
     kalshi_strong_allocation_pct: float = Field(default=0.90, alias="KALSHI_STRONG_ALLOCATION_PCT")
-    kalshi_enter_voi_threshold: float = Field(default=0.45, alias="KALSHI_ENTER_VOI_THRESHOLD")
-    kalshi_eval_batch_size: int = Field(default=6, alias="KALSHI_EVAL_BATCH_SIZE")
+    kalshi_max_entry_pct: float = Field(default=0.50, alias="KALSHI_MAX_ENTRY_PCT")
+    kalshi_enter_voi_threshold: float = Field(default=0.28, alias="KALSHI_ENTER_VOI_THRESHOLD")
+    kalshi_require_strong_enter: bool = Field(
+        default=False,
+        alias="KALSHI_REQUIRE_STRONG_ENTER",
+    )
+    kalshi_prefer_15m: bool = Field(default=True, alias="KALSHI_PREFER_15M")
+    kalshi_stop_loss_prob: float = Field(default=0.10, alias="KALSHI_STOP_LOSS_PROB")
+    kalshi_take_profit_prob: float = Field(default=0.15, alias="KALSHI_TAKE_PROFIT_PROB")
+    kalshi_flip_min_edge: float = Field(default=0.05, alias="KALSHI_FLIP_MIN_EDGE")
+    kalshi_position_poll_sec: float = Field(default=4.0, alias="KALSHI_POSITION_POLL_SEC")
+    kalshi_time_stop_sec: float = Field(default=90.0, alias="KALSHI_TIME_STOP_SEC")
+    kalshi_eval_batch_size: int = Field(default=4, alias="KALSHI_EVAL_BATCH_SIZE")
     kalshi_filter_mode: Literal["blocklist", "allowlist"] = Field(
         default="blocklist",
         alias="KALSHI_FILTER_MODE",

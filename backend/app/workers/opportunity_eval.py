@@ -1,4 +1,4 @@
-"""Kalshi-first opportunity evaluation via xAI + Futures Wheel context."""
+"""Kalshi-first opportunity evaluation via xAI + odds heuristics + Futures Wheel."""
 
 from __future__ import annotations
 
@@ -15,18 +15,19 @@ from backend.app.workers.edge_engine import _liquidity, _mid_prob, _spread
 
 logger = logging.getLogger(__name__)
 
-EVAL_SYSTEM = """You are NexusPMT opportunity desk evaluating Kalshi prediction markets.
-Given a Kalshi market/event (often multiple outcome contracts), WorldMap intel, and Futures Wheel nodes:
-1) Estimate true probability for the best actionable contract (YES or NO).
-2) Compare to market mid price to find edge / value of interest.
-3) Decide ENTER or SKIP.
-Rules:
-- Fundamentals only (economics, politics, geopolitics, energy, climate, tech, crypto_macro, trade). Never sports/entertainment.
-- Be skeptical but not paralyzed. Sports/entertainment are out of scope; everything else is fair game.
-- Do NOT skip solely because a market is weather or far-dated if edge/VOI is real.
-- Reply JSON only, no markdown:
+EVAL_SYSTEM = """You are NexusPMT — an active prediction-market trading desk.
+Goal: earn by being correct more often than wrong. Win some, lose some; do NOT freeze.
+
+Given a Kalshi market, WorldMap intel, and Futures Wheel nodes:
+1) Estimate true probability for YES.
+2) Compare to market mid → pick YES or NO with the better odds.
+3) Prefer ENTER over SKIP when there is a usable edge or clear favorite/fade.
+4) 15-minute crypto up/down IS in scope for live desk testing — trade it.
+5) Missing intel is not a reason to SKIP; use the book + wheel + siblings.
+6) Reply JSON only:
 {"verdict":"ENTER"|"SKIP","side":"yes"|"no","ticker":"...","model_prob":0.0-1.0,"confidence":0.0-1.0,"value_of_interest":0.0-1.0,"strength":"strong"|"weak","reason":"...","wheel_contribution":"..."}
-- value_of_interest is attractiveness (0-1). Prefer ENTER when strength=strong, VOI clears the desk threshold, and edge is meaningful.
+- value_of_interest = how actionable (0-1). ENTER when VOI or edge is real.
+- strength=weak is OK for live testing when side odds are clear.
 """
 
 
@@ -75,6 +76,114 @@ def _extract_json(text: str) -> dict[str, Any]:
     raise ValueError("no json object")
 
 
+def odds_heuristic_verdict(
+    candidate: dict[str, Any],
+    *,
+    enter_voi_threshold: float = 0.28,
+    min_edge: float = 0.03,
+    max_spread_for_enter: float = 0.10,
+) -> OpportunityVerdict:
+    """Tradeable offline / no-LLM path — never always-SKIP.
+
+    Mild favorites (mid 0.55–0.72): fade toward 0.5 (manual SOL-style).
+    Strong favorites (mid ≥ 0.72 or ≤ 0.28): follow momentum.
+    """
+    mid = float(candidate.get("market_prob") or 0.5)
+    spread = candidate.get("spread")
+    try:
+        spread_f = float(spread) if spread is not None else 0.05
+    except (TypeError, ValueError):
+        spread_f = 0.05
+    ticker = str(candidate.get("ticker") or "")
+
+    if mid <= 0.12 or mid >= 0.88:
+        return OpportunityVerdict(
+            verdict="SKIP",
+            side="yes",
+            ticker=ticker,
+            model_prob=mid,
+            market_prob=mid,
+            confidence=0.2,
+            value_of_interest=0.05,
+            strength="weak",
+            reason="odds heuristic: mid too extreme",
+            category=candidate.get("category"),
+            title=candidate.get("title"),
+            edge=0.0,
+        )
+    if spread_f > max_spread_for_enter:
+        return OpportunityVerdict(
+            verdict="SKIP",
+            side="yes",
+            ticker=ticker,
+            model_prob=mid,
+            market_prob=mid,
+            confidence=0.2,
+            value_of_interest=0.05,
+            strength="weak",
+            reason=f"odds heuristic: spread {spread_f:.2f} too wide",
+            category=candidate.get("category"),
+            title=candidate.get("title"),
+            edge=0.0,
+        )
+
+    dist = mid - 0.5
+    if abs(dist) < 0.04:
+        return OpportunityVerdict(
+            verdict="SKIP",
+            side="yes",
+            ticker=ticker,
+            model_prob=mid,
+            market_prob=mid,
+            confidence=0.25,
+            value_of_interest=0.1,
+            strength="weak",
+            reason="odds heuristic: coin-flip mid",
+            category=candidate.get("category"),
+            title=candidate.get("title"),
+            edge=0.0,
+        )
+
+    # Strong favorite → follow; mild favorite → fade
+    if abs(dist) >= 0.22:
+        side = "yes" if dist > 0 else "no"
+        # slight confidence beyond market
+        model = min(0.92, mid + 0.04) if side == "yes" else max(0.08, mid - 0.04)
+        strength = "strong"
+        style = "follow"
+    else:
+        side = "no" if dist > 0 else "yes"
+        model = 0.50  # mean-reversion fair value
+        strength = "weak"
+        style = "fade"
+
+    if side == "yes":
+        edge = model - mid
+    else:
+        edge = (1.0 - model) - (1.0 - mid)
+    voi = min(0.95, abs(edge) * 2.2 + (0.08 if candidate.get("micro_horizon") else 0.0))
+    # Boost VOI for micro so live desk actually fires
+    if candidate.get("micro_horizon"):
+        voi = max(voi, enter_voi_threshold)
+
+    enter = voi >= enter_voi_threshold or abs(edge) >= min_edge
+    return OpportunityVerdict(
+        verdict="ENTER" if enter else "SKIP",
+        side=side,  # type: ignore[arg-type]
+        ticker=ticker,
+        model_prob=round(float(model), 4),
+        market_prob=mid,
+        confidence=0.55 if style == "follow" else 0.45,
+        value_of_interest=round(voi, 3),
+        strength=strength,  # type: ignore[arg-type]
+        reason=f"odds heuristic {style}: mid={mid:.2f} edge={edge:+.3f} voi={voi:.2f}",
+        wheel_contribution="none",
+        category=candidate.get("category"),
+        title=candidate.get("title"),
+        edge=round(edge, 4),
+    )
+
+
 def collect_candidate_markets(
     markets: list[dict[str, Any]],
     series_by: dict[str, dict[str, Any]],
@@ -84,22 +193,21 @@ def collect_candidate_markets(
     min_liquidity: float,
     limit: int = 12,
     funded_shards: set[int] | None = None,
+    prefer_micro: bool = False,
 ) -> list[dict[str, Any]]:
-    """Pick liquid fundamental open markets as evaluation candidates.
+    """Pick liquid open markets as evaluation candidates.
 
-    When ``funded_shards`` is set, only markets whose ``exchange_index`` is in
-    that set are kept — cash on Kalshi is per-shard and cannot fund other shards.
+    When ``funded_shards`` is set, only markets on those exchange shards are kept.
+    When ``prefer_micro`` is True, 15m/hourly series are ranked first (live desk).
     """
     out: list[dict[str, Any]] = []
     for market in markets:
         ticker = str(market.get("ticker") or "")
-        # Skip multivariate combo markets — noisy and usually empty books
         if "MVE" in ticker.upper() or market.get("mve_collection_ticker"):
             continue
         series = series_by.get(str(market.get("series_ticker") or "")) or series_by.get(
             str(market.get("event_ticker") or "").rsplit("-", 1)[0]
         )
-        # Prefer markets we can attribute to an allowlisted series
         if series is None and series_by:
             continue
         if not market_filter.allow_market(market, series):
@@ -116,7 +224,6 @@ def collect_candidate_markets(
         if mid is None or mid <= 0.02 or mid >= 0.98:
             continue
         spread = _spread(market)
-        # Empty book often reports spread 0 with 0/0 — already excluded by mid
         if spread is not None and spread > max_spread:
             continue
         liq = _liquidity(market)
@@ -140,16 +247,25 @@ def collect_candidate_markets(
                 "liquidity": liq,
                 "exchange_index": exchange_index,
                 "micro_horizon": micro,
+                "close_time": market.get("close_time") or market.get("expected_expiration_time"),
                 "raw": market,
             }
         )
-    # Prefer non-microstructure, then mid-range probs (more interesting)
-    out.sort(
-        key=lambda m: (
-            1 if m.get("micro_horizon") else 0,
-            abs(float(m["market_prob"]) - 0.5),
+    if prefer_micro:
+        # Micro first, then closer to actionable mids (not necessarily 0.5)
+        out.sort(
+            key=lambda m: (
+                0 if m.get("micro_horizon") else 1,
+                abs(float(m["market_prob"]) - 0.5),
+            )
         )
-    )
+    else:
+        out.sort(
+            key=lambda m: (
+                1 if m.get("micro_horizon") else 0,
+                abs(float(m["market_prob"]) - 0.5),
+            )
+        )
     return out[:limit]
 
 
@@ -160,11 +276,16 @@ class OpportunityEvaluator:
         api_key: str,
         base_url: str,
         model: str,
-        enter_voi_threshold: float = 0.65,
+        enter_voi_threshold: float = 0.28,
+        require_strong_enter: bool = False,
+        min_edge: float = 0.03,
     ) -> None:
         self.model = model
         self.enter_voi_threshold = enter_voi_threshold
+        self.require_strong_enter = require_strong_enter
+        self.min_edge = min_edge
         self._client = AsyncOpenAI(api_key=api_key or "missing", base_url=base_url)
+        self._llm_disabled_reason: str | None = None
 
     async def evaluate(
         self,
@@ -173,6 +294,7 @@ class OpportunityEvaluator:
         siblings: list[dict[str, Any]],
         intel_snippets: list[str],
         wheel_nodes: list[dict[str, Any]],
+        position: dict[str, Any] | None = None,
     ) -> OpportunityVerdict:
         market_prob = float(candidate.get("market_prob") or 0.5)
         ticker = str(candidate.get("ticker") or "")
@@ -182,8 +304,10 @@ class OpportunityEvaluator:
                 "title": candidate.get("title"),
                 "category": candidate.get("category"),
                 "market_prob": market_prob,
+                "spread": candidate.get("spread"),
                 "yes": candidate.get("yes_sub_title"),
                 "no": candidate.get("no_sub_title"),
+                "micro_horizon": candidate.get("micro_horizon"),
             },
             "related_outcomes": [
                 {
@@ -195,10 +319,19 @@ class OpportunityEvaluator:
             ],
             "worldmap_intel": intel_snippets[:25],
             "futures_wheel": wheel_nodes[:12],
+            "open_position": position,
+            "instruction": (
+                "If open_position is set, recommend hold/stop/flip via side+verdict; "
+                "if flat, ENTER the better odds side."
+            ),
         }
 
         if not self._client.api_key or self._client.api_key == "missing":
-            return self._heuristic(candidate, market_prob)
+            return odds_heuristic_verdict(
+                candidate,
+                enter_voi_threshold=self.enter_voi_threshold,
+                min_edge=self.min_edge,
+            )
 
         try:
             try:
@@ -208,7 +341,7 @@ class OpportunityEvaluator:
                         {"role": "system", "content": EVAL_SYSTEM},
                         {"role": "user", "content": json.dumps(payload)},
                     ],
-                    temperature=0.2,
+                    temperature=0.3,
                     response_format={"type": "json_object"},
                 )
             except Exception:
@@ -218,7 +351,7 @@ class OpportunityEvaluator:
                         {"role": "system", "content": EVAL_SYSTEM},
                         {"role": "user", "content": json.dumps(payload)},
                     ],
-                    temperature=0.2,
+                    temperature=0.3,
                 )
             raw = resp.choices[0].message.content or "{}"
             data = _extract_json(raw)
@@ -226,53 +359,41 @@ class OpportunityEvaluator:
             data["market_prob"] = market_prob
             model_prob = float(data.get("model_prob") or market_prob)
             side = str(data.get("side") or "yes").lower()
-            edge = (model_prob - market_prob) if side == "yes" else ((1.0 - model_prob) - (1.0 - market_prob))
-            # If side=no, edge vs no price
             if side == "no":
                 no_mkt = 1.0 - market_prob
                 no_model = 1.0 - model_prob
                 edge = no_model - no_mkt
+            else:
+                edge = model_prob - market_prob
             data["edge"] = round(edge, 4)
             data["category"] = candidate.get("category")
             data["title"] = candidate.get("title")
             verdict = OpportunityVerdict.model_validate(data)
-            # Enforce gates
-            if (
-                verdict.verdict == "ENTER"
-                and (
-                    verdict.strength != "strong"
-                    or verdict.value_of_interest < self.enter_voi_threshold
-                    or abs(verdict.edge) < 0.03
+            if verdict.verdict == "ENTER":
+                need_strong = self.require_strong_enter and verdict.strength != "strong"
+                thin = (
+                    verdict.value_of_interest < self.enter_voi_threshold
+                    and abs(verdict.edge) < self.min_edge
                 )
-            ):
-                verdict.verdict = "SKIP"
-                verdict.strength = "weak"
-                verdict.reason = (
-                    (verdict.reason or "")
-                    + " | downgraded: need strong + VOI>="
-                    + str(self.enter_voi_threshold)
-                    + " + edge"
-                ).strip(" |")
+                if need_strong or thin:
+                    verdict.verdict = "SKIP"
+                    verdict.strength = "weak"
+                    verdict.reason = (
+                        (verdict.reason or "")
+                        + f" | downgraded: VOI/edge gate (voi>={self.enter_voi_threshold} or edge>={self.min_edge}"
+                        + ("; strong required" if self.require_strong_enter else "")
+                        + ")"
+                    ).strip(" |")
+            self._llm_disabled_reason = None
             return verdict
-        except Exception:
-            logger.exception("opportunity eval failed for %s", ticker)
-            return self._heuristic(candidate, market_prob)
-
-    def _heuristic(self, candidate: dict[str, Any], market_prob: float) -> OpportunityVerdict:
-        # Conservative offline fallback — almost always SKIP unless extreme mid
-        voi = abs(market_prob - 0.5) * 0.4
-        return OpportunityVerdict(
-            verdict="SKIP",
-            side="yes",
-            ticker=str(candidate.get("ticker") or ""),
-            model_prob=market_prob,
-            market_prob=market_prob,
-            confidence=0.2,
-            value_of_interest=round(voi, 3),
-            strength="weak",
-            reason="Heuristic fallback only (no LLM) — skipping until xAI eval available",
-            wheel_contribution="none",
-            category=candidate.get("category"),
-            title=candidate.get("title"),
-            edge=0.0,
-        )
+        except Exception as exc:
+            # Credits / network — fall back to odds heuristic that CAN enter
+            self._llm_disabled_reason = f"{type(exc).__name__}: {exc}"
+            logger.warning("opportunity eval LLM failed for %s: %s", ticker, exc)
+            v = odds_heuristic_verdict(
+                candidate,
+                enter_voi_threshold=self.enter_voi_threshold,
+                min_edge=self.min_edge,
+            )
+            v.reason = f"{v.reason} (LLM unavailable: {type(exc).__name__})"
+            return v

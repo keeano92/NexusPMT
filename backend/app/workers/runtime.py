@@ -22,11 +22,15 @@ from backend.app.kalshi.portfolio import (
 )
 from backend.app.state import AppState
 from backend.app.timeutil import local_iso
-from backend.app.workers.edge_engine import score_edges
+from backend.app.workers.edge_engine import score_edges, _mid_prob
 from backend.app.workers.futures_wheel import FuturesWheelEngine
 from backend.app.workers.opportunity_eval import (
     OpportunityEvaluator,
     collect_candidate_markets,
+)
+from backend.app.workers.position_manager import (
+    build_close_v2_order,
+    decide_position_action,
 )
 from backend.app.worldmap.client import WorldMapClient
 
@@ -71,6 +75,8 @@ class AutonomyRuntime:
         self._recent_evals: dict[str, float] = {}
         self._last_block_log_ts: float = 0.0
         self._soft_reject_cycle: bool = False
+        # ticker -> {side, entry_yes_prob, exchange_index, opened_ts}
+        self._entry_marks: dict[str, dict[str, Any]] = {}
 
     async def start(self) -> None:
         s = self.state.settings
@@ -87,6 +93,8 @@ class AutonomyRuntime:
             base_url=s.xai_base_url,
             model=s.xai_model,
             enter_voi_threshold=s.kalshi_enter_voi_threshold,
+            require_strong_enter=bool(s.kalshi_require_strong_enter),
+            min_edge=float(s.kalshi_min_edge),
         )
         if s.kalshi_key_id:
             try:
@@ -113,6 +121,7 @@ class AutonomyRuntime:
             asyncio.create_task(self._ingest_loop(), name="ingest"),
             asyncio.create_task(self._opportunity_loop(), name="opportunities"),
             asyncio.create_task(self._trade_loop(), name="trade"),
+            asyncio.create_task(self._position_manage_loop(), name="position_mgr"),
             asyncio.create_task(self._pnl_heartbeat(), name="pnl"),
         ]
     async def stop(self) -> None:
@@ -378,13 +387,17 @@ class AutonomyRuntime:
                 return 0.0
 
             def _is_micro_horizon(ser: dict[str, Any]) -> bool:
-                """15m/hourly crypto is microstructure noise — deprioritize for ENTER."""
                 t = str(ser.get("ticker") or "").upper()
                 return any(tag in t for tag in ("15M", "1H", "5M", "10M", "30M"))
 
+            prefer_15m = bool(s.kalshi_prefer_15m)
+
             def _series_rank_key(ser: dict[str, Any]) -> tuple[int, float]:
-                # Prefer non-micro series, then volume
-                return (1 if _is_micro_horizon(ser) else 0, -_vol(ser))
+                # Live desk: prefer 15m first on funded shards; else demote micro.
+                micro = _is_micro_horizon(ser)
+                if prefer_15m:
+                    return (0 if micro else 1, -_vol(ser))
+                return (1 if micro else 0, -_vol(ser))
 
             for cat in cats:
                 try:
@@ -414,7 +427,11 @@ class AutonomyRuntime:
                     ]
                     rest = [ser for ser in non_micro if ser not in monthly]
                     micro = [ser for ser in cat_series if _is_micro_horizon(ser)]
-                    picked = monthly[:10] + rest[:6] + micro[:2]
+                    if prefer_15m:
+                        # Active desk: 15m first (SOL/BTC/ETH…), monthly as backup
+                        picked = micro[:10] + monthly[:6] + rest[:4]
+                    else:
+                        picked = monthly[:10] + rest[:6] + micro[:2]
                 elif cat.lower() == "financials":
                     picked = cat_series[:10]
                 else:
@@ -561,14 +578,19 @@ class AutonomyRuntime:
                 await self.state.publish({"type": "edges", "edges": [], "scanned_at": _iso()})
                 return
 
+        # Slightly wider spread tolerance for fast 15m books
+        scan_spread = float(s.kalshi_max_spread)
+        if s.kalshi_prefer_15m:
+            scan_spread = max(scan_spread, 0.12)
         candidates = collect_candidate_markets(
             markets,
             series_by,
             self.state.market_filter,
-            max_spread=s.kalshi_max_spread,
+            max_spread=scan_spread,
             min_liquidity=s.kalshi_min_liquidity,
             limit=max(6, int(s.kalshi_eval_batch_size) * 2),
             funded_shards=funded_filter,
+            prefer_micro=bool(s.kalshi_prefer_15m),
         )
         shard_note = (
             f" on shards {sorted(funded_filter)}" if funded_filter is not None else ""
@@ -596,7 +618,9 @@ class AutonomyRuntime:
         for cand in batch:
             ticker = str(cand.get("ticker") or "")
             last = self._recent_evals.get(ticker)
-            if last is not None and (now - last) < 180:
+            # 15m books move fast — re-eval sooner than monthly
+            cooldown = 45 if cand.get("micro_horizon") else 180
+            if last is not None and (now - last) < cooldown:
                 continue
             siblings = by_event.get(str(cand.get("event_ticker") or ticker), [cand])
             self.state.terminal(
@@ -616,10 +640,13 @@ class AutonomyRuntime:
             self.state.evaluations = (evaluations + [
                 e for e in self.state.evaluations if e.get("ticker") not in {x.get("ticker") for x in evaluations}
             ])[:80]
-            if verdict.verdict == "ENTER" and verdict.strength == "strong":
+            allow_enter = verdict.verdict == "ENTER" and (
+                verdict.strength == "strong" or not s.kalshi_require_strong_enter
+            )
+            if allow_enter:
                 self.state.terminal(
                     f"ENTER {ticker} {verdict.side.upper()} VOI={verdict.value_of_interest:.2f} "
-                    f"edge={verdict.edge:+.2%} :: {verdict.reason}"[:180]
+                    f"edge={verdict.edge:+.2%} str={verdict.strength} :: {verdict.reason}"[:180]
                 )
                 edge_row = EdgeCandidate(
                     ticker=verdict.ticker,
@@ -635,6 +662,9 @@ class AutonomyRuntime:
                 ).model_dump()
                 if cand.get("exchange_index") is not None:
                     edge_row["exchange_index"] = cand.get("exchange_index")
+                if cand.get("close_time"):
+                    edge_row["close_time"] = cand.get("close_time")
+                edge_row["micro_horizon"] = bool(cand.get("micro_horizon"))
                 enter_edges.append(edge_row)
                 self.state.edges = list(enter_edges)
             else:
@@ -796,7 +826,12 @@ class AutonomyRuntime:
         else:
             cash = max(0, self.state.book().cash_cents())
 
-        alloc = int(cash * float(s.kalshi_strong_allocation_pct))
+        # Cap entry so one stop-loss cannot wipe the shard (live-test default 50%).
+        entry_pct = min(
+            float(s.kalshi_strong_allocation_pct),
+            float(getattr(s, "kalshi_max_entry_pct", 0.5) or 0.5),
+        )
+        alloc = int(cash * entry_pct)
         if alloc <= 0:
             self.state.terminal(f"SKIP {ticker} — no cash in book {self.state.active_book_key}")
             return False
@@ -887,6 +922,13 @@ class AutonomyRuntime:
             )
             self.state.failsafes.record_api_success()
             self._recent_trades[ticker] = time.time()
+            self._entry_marks[ticker] = {
+                "side": intent.side,
+                "entry_yes_prob": float(intent.yes_price or 50) / 100.0,
+                "exchange_index": exchange_index,
+                "opened_ts": time.time(),
+                "count": intent.count,
+            }
             await self.sync_live_portfolio()
             await self.state.publish({"type": "ledger"})
             return True
@@ -1163,8 +1205,250 @@ class AutonomyRuntime:
             "model": wheel.raw_model,
         }
 
+    async def _position_manage_loop(self) -> None:
+        """Watch open positions; stop-loss / take-profit / flip / time-stop."""
+        while not self._stop.is_set():
+            try:
+                if (
+                    self.state.failsafes.can_place_orders()
+                    and self.state.settings.kalshi_trading_mode == "live"
+                    and self.state.positions
+                ):
+                    await self._manage_open_positions()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("position manage loop error")
+            interval = max(2.0, float(self.state.settings.kalshi_position_poll_sec))
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _manage_open_positions(self) -> None:
+        assert self._kalshi
+        s = self.state.settings
+        # Refresh marks
+        await self.sync_live_portfolio()
+        for pos in list(self.state.positions):
+            ticker = str(pos.get("ticker") or "")
+            if not ticker:
+                continue
+            side = str(pos.get("side") or "yes").lower()
+            qty = int(pos.get("qty") or 0)
+            if qty <= 0:
+                continue
+            entry = self._entry_marks.get(ticker) or {}
+            entry_yes = float(entry.get("entry_yes_prob") or 0)
+            if entry_yes <= 0:
+                # Reconstruct from avg_price_cents if we missed the mark
+                avg = int(pos.get("avg_price_cents") or 0)
+                entry_yes = (avg / 100.0) if side == "yes" else max(0.01, 1.0 - avg / 100.0)
+
+            mark_yes = await self._fetch_mark_yes(ticker)
+            if mark_yes is None:
+                continue
+
+            # Optional re-eval for flip signal (odds heuristic — fast, no LLM required)
+            flip_side = None
+            if self._evaluator:
+                try:
+                    verdict = await self._evaluator.evaluate(
+                        {
+                            "ticker": ticker,
+                            "market_prob": mark_yes,
+                            "spread": 0.04,
+                            "category": pos.get("category") or "Crypto",
+                            "title": ticker,
+                            "micro_horizon": "15M" in ticker.upper(),
+                            "series_ticker": ticker.rsplit("-", 1)[0] if "-" in ticker else ticker,
+                        },
+                        siblings=[],
+                        intel_snippets=self.state.intel_snippets,
+                        wheel_nodes=self.state.wheel_nodes,
+                        position={"side": side, "qty": qty, "entry_yes": entry_yes},
+                    )
+                    if verdict.verdict == "ENTER" and verdict.side != side:
+                        flip_side = verdict.side
+                except Exception:
+                    logger.exception("re-eval for %s failed", ticker)
+
+            sec_left = await self._seconds_to_close(ticker)
+            decision = decide_position_action(
+                side=side,
+                entry_yes_prob=entry_yes,
+                mark_yes_prob=mark_yes,
+                stop_loss_prob=float(s.kalshi_stop_loss_prob),
+                take_profit_prob=float(s.kalshi_take_profit_prob),
+                flip_side=flip_side,
+                flip_min_edge=float(s.kalshi_flip_min_edge),
+                seconds_to_close=sec_left,
+                time_stop_sec=float(s.kalshi_time_stop_sec),
+            )
+            if decision.action == "hold":
+                continue
+
+            self.state.terminal(
+                f"{decision.action.upper()} {ticker} {side} mark={mark_yes:.2f} "
+                f"entry={entry_yes:.2f} pnl={decision.pnl_prob:+.3f} :: {decision.reason}"[:180]
+            )
+            closed = await self._live_close_position(
+                ticker=ticker,
+                side=side,
+                qty=qty,
+                mark_yes=mark_yes,
+                exchange_index=entry.get("exchange_index") or pos.get("exchange_index"),
+                status=decision.action,
+                reason=decision.reason,
+            )
+            if closed and decision.action == "flip" and decision.flip_to:
+                # Immediately enter opposite side (bypass cooldown from the close)
+                self._recent_trades.pop(ticker, None)
+                await self.sync_live_portfolio()
+                await self._maybe_trade(
+                    {
+                        "ticker": ticker,
+                        "side": decision.flip_to,
+                        "market_prob": mark_yes,
+                        "action": "buy_yes" if decision.flip_to == "yes" else "buy_no",
+                        "category": "Crypto",
+                        "title": ticker,
+                        "exchange_index": entry.get("exchange_index") or pos.get("exchange_index"),
+                        "edge": abs(decision.pnl_prob),
+                        "micro_horizon": True,
+                    }
+                )
+
+    async def _fetch_mark_yes(self, ticker: str) -> float | None:
+        if not self._kalshi:
+            return None
+        try:
+            resp = await self._kalshi.list_markets(tickers=ticker, limit=1)
+            markets = resp.get("markets") or []
+            if not markets:
+                return None
+            mid = _mid_prob(markets[0])
+            return float(mid) if mid is not None else None
+        except Exception:
+            logger.exception("mark fetch failed for %s", ticker)
+            return None
+
+    async def _seconds_to_close(self, ticker: str) -> float | None:
+        if not self._kalshi:
+            return None
+        try:
+            from datetime import datetime, timezone
+
+            resp = await self._kalshi.list_markets(tickers=ticker, limit=1)
+            markets = resp.get("markets") or []
+            if not markets:
+                return None
+            ct = markets[0].get("close_time") or markets[0].get("expected_expiration_time")
+            if not ct:
+                return None
+            if isinstance(ct, (int, float)):
+                close_ts = float(ct)
+            else:
+                close_ts = datetime.fromisoformat(str(ct).replace("Z", "+00:00")).timestamp()
+            return max(0.0, close_ts - datetime.now(timezone.utc).timestamp())
+        except Exception:
+            return None
+
+    async def _live_close_position(
+        self,
+        *,
+        ticker: str,
+        side: str,
+        qty: int,
+        mark_yes: float,
+        exchange_index: Any,
+        status: str,
+        reason: str,
+        actor: str = "system",
+    ) -> bool:
+        if not self._kalshi:
+            return False
+        try:
+            ex = int(exchange_index) if exchange_index is not None else None
+        except (TypeError, ValueError):
+            ex = None
+        body = build_close_v2_order(
+            ticker=ticker,
+            position_side=side,
+            count=qty,
+            mark_yes_prob=mark_yes,
+            exchange_index=ex,
+        )
+        try:
+            resp = await self._kalshi.create_order(body)
+            self.state.failsafes.record_api_success()
+            self._entry_marks.pop(ticker, None)
+            self._recent_trades[ticker] = __import__("time").time()
+            self.state.ledger.append(
+                kind="order",
+                ticker=ticker,
+                side=side,
+                qty=qty,
+                price_cents=int(round(mark_yes * 100)),
+                mode="live",
+                status=status,
+                message=f"{status} by {actor}: {reason}",
+                meta={"request": body, "response": resp},
+            )
+            await self.sync_live_portfolio()
+            await self.state.publish({"type": "ledger"})
+            return True
+        except Exception as exc:
+            friendly = _friendly_kalshi_error(exc)
+            if is_soft_order_reject(exc):
+                self.state.terminal(f"SOFT REJECT close {ticker}: {friendly}")
+                self.state.ledger.append(
+                    kind="order",
+                    ticker=ticker,
+                    side=side,
+                    qty=qty,
+                    mode="live",
+                    status="soft_reject",
+                    message=f"close {status} soft: {friendly}",
+                )
+            else:
+                self.state.failsafes.record_api_error()
+                self.state.terminal(f"CLOSE ERROR {ticker}: {friendly}")
+                self.state.ledger.append(
+                    kind="order",
+                    ticker=ticker,
+                    side=side,
+                    qty=qty,
+                    mode="live",
+                    status="error",
+                    message=f"close {status} error: {friendly}",
+                )
+            await self.state.publish({"type": "ledger"})
+            return False
+
     async def flatten_all(self, actor: str = "operator") -> None:
-        """Manual fail-safe: flatten paper positions (live cancel/offset best-effort)."""
+        """Manual fail-safe: flatten paper or live positions."""
+        if self.state.settings.kalshi_trading_mode == "live" and self._kalshi:
+            await self.sync_live_portfolio()
+            for pos in list(self.state.positions):
+                ticker = str(pos.get("ticker") or "")
+                side = str(pos.get("side") or "yes")
+                qty = int(pos.get("qty") or 0)
+                if not ticker or qty <= 0:
+                    continue
+                mark = await self._fetch_mark_yes(ticker) or 0.5
+                await self._live_close_position(
+                    ticker=ticker,
+                    side=side,
+                    qty=qty,
+                    mark_yes=mark,
+                    exchange_index=(self._entry_marks.get(ticker) or {}).get("exchange_index"),
+                    status="flattened",
+                    reason=f"flatten_all by {actor}",
+                    actor=actor,
+                )
+            return
+
         for ticker, pos in list(self.state.paper_positions.items()):
             qty = int(pos.get("qty") or 0)
             if qty <= 0:
@@ -1188,6 +1472,23 @@ class AutonomyRuntime:
         await self.state.publish({"type": "pnl", "pnl": self.state.pnl.all_horizons()})
 
     async def close_position(self, ticker: str, actor: str = "operator") -> bool:
+        if self.state.settings.kalshi_trading_mode == "live" and self._kalshi:
+            await self.sync_live_portfolio()
+            pos = next((p for p in self.state.positions if str(p.get("ticker")) == ticker), None)
+            if not pos:
+                return False
+            mark = await self._fetch_mark_yes(ticker) or 0.5
+            return await self._live_close_position(
+                ticker=ticker,
+                side=str(pos.get("side") or "yes"),
+                qty=int(pos.get("qty") or 0),
+                mark_yes=mark,
+                exchange_index=(self._entry_marks.get(ticker) or {}).get("exchange_index"),
+                status="closed",
+                reason=f"Close by {actor}",
+                actor=actor,
+            )
+
         pos = self.state.paper_positions.pop(ticker, None)
         if not pos:
             return False
