@@ -251,20 +251,31 @@ class AutonomyRuntime:
         return f"Futures wheel for: {snippets[0][:200]}"
 
     async def _refresh_edges(self, nodes: list[Any]) -> None:
+        """Wheel heuristic edges — only feed the trade loop when secondary is enabled.
+
+        Production defaults keep secondary off; opportunity ENTER owns ``state.edges``.
+        Writing unscoped score_edges here previously overwrote shard-filtered ENTERs
+        and re-armed unfunded shard-0 markets for auto-trade.
+        """
+        s = self.state.settings
+        allow_secondary = bool(s.kalshi_allow_secondary_edges) and s.kalshi_env != "production"
+        if not allow_secondary:
+            return
+
         markets: list[dict[str, Any]] = []
         series_by: dict[str, dict[str, Any]] = {}
         if self._kalshi:
             try:
                 cats = [
                     c.strip()
-                    for c in self.state.settings.kalshi_category_allowlist.split(",")
+                    for c in s.kalshi_category_allowlist.split(",")
                     if c.strip()
                 ]
-                for cat in cats[:6]:
+                for cat in cats:
                     series_resp = await self._kalshi.list_series(category=cat)
-                    for s in series_resp.get("series") or []:
-                        if self.state.market_filter.allow_series(s):
-                            series_by[str(s.get("ticker"))] = s
+                    for ser in series_resp.get("series") or []:
+                        if self.state.market_filter.allow_series(ser):
+                            series_by[str(ser.get("ticker"))] = ser
                 for st in list(series_by.keys())[:25]:
                     try:
                         mresp = await self._kalshi.list_markets(
@@ -294,6 +305,7 @@ class AutonomyRuntime:
                     "yes_bid_dollars": "0.42",
                     "yes_ask_dollars": "0.46",
                     "volume_fp": "5000",
+                    "exchange_index": 0,
                 }
             ]
             series_by["DEMO-FED"] = {"ticker": "DEMO-FED", "category": "Economics", "title": "Fed", "tags": []}
@@ -303,11 +315,23 @@ class AutonomyRuntime:
             markets,
             series_by,
             self.state.market_filter,
-            min_edge=self.state.settings.kalshi_min_edge,
-            max_spread=self.state.settings.kalshi_max_spread,
-            min_liquidity=self.state.settings.kalshi_min_liquidity,
+            min_edge=s.kalshi_min_edge,
+            max_spread=s.kalshi_max_spread,
+            min_liquidity=s.kalshi_min_liquidity,
         )
-        self.state.edges = [e.model_dump() for e in edges]
+        rows: list[dict[str, Any]] = []
+        for e in edges:
+            row = e.model_dump()
+            # Attach exchange_index from the matched market when present
+            for m in markets:
+                if str(m.get("ticker")) == row.get("ticker") and m.get("exchange_index") is not None:
+                    try:
+                        row["exchange_index"] = int(m.get("exchange_index"))
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            rows.append(row)
+        self.state.edges = rows
         await self.state.publish({"type": "edges", "edges": self.state.edges})
 
     async def _opportunity_loop(self) -> None:
@@ -341,8 +365,19 @@ class AutonomyRuntime:
         markets: list[dict[str, Any]] = []
         try:
             cats = [c.strip() for c in s.kalshi_category_allowlist.split(",") if c.strip()]
+            # Do NOT truncate cats[:6] — that dropped Crypto (exchange shard 2) and
+            # left the desk with only unfunded shard-0 markets.
             ranked_series: list[dict[str, Any]] = []
-            for cat in cats[:6]:
+
+            def _vol(ser: dict[str, Any]) -> float:
+                for k in ("volume_fp", "volume", "open_interest"):
+                    try:
+                        return float(ser.get(k) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                return 0.0
+
+            for cat in cats:
                 try:
                     series_resp = await self._kalshi.list_series(
                         category=cat, include_volume="true"
@@ -354,24 +389,19 @@ class AutonomyRuntime:
                     for ser in (series_resp.get("series") or [])
                     if self.state.market_filter.allow_series(ser)
                 ]
-
-                def _vol(ser: dict[str, Any]) -> float:
-                    for k in ("volume_fp", "volume", "open_interest"):
-                        try:
-                            return float(ser.get(k) or 0)
-                        except (TypeError, ValueError):
-                            continue
-                    return 0.0
-
                 cat_series.sort(key=_vol, reverse=True)
-                for ser in cat_series[:4]:
+                # Crypto / Financials often live on non-zero shards — take more series
+                take = 8 if cat.lower() in {"crypto", "financials"} else 4
+                for ser in cat_series[:take]:
                     series_by[str(ser.get("ticker"))] = ser
                     ranked_series.append(ser)
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.12)
 
-            # Pull markets only for top series (avoid 429 + empty MVE dump)
+            # Prefer higher volume overall, but keep category diversity
+            ranked_series.sort(key=_vol, reverse=True)
+            # Pull markets for top series (avoid 429 + empty MVE dump)
             seen: set[str] = set()
-            for ser in ranked_series[:18]:
+            for ser in ranked_series[:28]:
                 st = str(ser.get("ticker") or "")
                 if not st:
                     continue
@@ -399,9 +429,69 @@ class AutonomyRuntime:
                         mkt = {**mkt, "series_ticker": st}
                     seen.add(t)
                     markets.append(mkt)
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.15)
+
+            # If live cash is on shard N but we pulled zero markets there, force Crypto tops.
+            shards_now = dict(self.state.book().live_shard_balances_cents or {})
+            funded_now = funded_exchange_indexes(shards_now, min_cents=1)
+            if s.kalshi_trading_mode == "live" and funded_now:
+                on_funded = sum(
+                    1
+                    for m in markets
+                    if m.get("exchange_index") is not None
+                    and int(m.get("exchange_index")) in funded_now
+                )
+                if on_funded == 0:
+                    self.state.terminal(
+                        f"PULL supplement — 0 markets on funded shards {sorted(funded_now)}; "
+                        "fetching Crypto tops"
+                    )
+                    try:
+                        crypto = await self._kalshi.list_series(
+                            category="Crypto", include_volume="true"
+                        )
+                    except Exception:
+                        crypto = {"series": []}
+                    crypto_series = [
+                        ser
+                        for ser in (crypto.get("series") or [])
+                        if self.state.market_filter.allow_series(ser)
+                    ]
+                    crypto_series.sort(key=_vol, reverse=True)
+                    for ser in crypto_series[:10]:
+                        st = str(ser.get("ticker") or "")
+                        if not st:
+                            continue
+                        series_by[st] = ser
+                        try:
+                            mresp = await self._kalshi.list_markets(
+                                status="open",
+                                series_ticker=st,
+                                limit=20,
+                                mve_filter="exclude",
+                            )
+                        except Exception:
+                            continue
+                        for mkt in mresp.get("markets") or []:
+                            t = str(mkt.get("ticker") or "")
+                            if not t or t in seen or "MVE" in t.upper():
+                                continue
+                            if not mkt.get("series_ticker"):
+                                mkt = {**mkt, "series_ticker": st}
+                            seen.add(t)
+                            markets.append(mkt)
+                        await asyncio.sleep(0.12)
+
+            by_ex: dict[int, int] = {}
+            for m in markets:
+                try:
+                    ex = int(m.get("exchange_index")) if m.get("exchange_index") is not None else -1
+                except (TypeError, ValueError):
+                    ex = -1
+                by_ex[ex] = by_ex.get(ex, 0) + 1
             self.state.terminal(
-                f"PULL series={len(series_by)} markets={len(markets)} (fundamentals only)"
+                f"PULL series={len(series_by)} markets={len(markets)} "
+                f"by_shard={dict(sorted(by_ex.items()))} (fundamentals only)"
             )
         except Exception as exc:
             self.state.terminal(f"ERROR Kalshi market pull failed: {exc}")
