@@ -86,6 +86,23 @@ def test_time_stop_when_underwater_near_expiry():
     assert d.action == "time_stop"
 
 
+def test_max_hold_forces_exit_for_paper():
+    d = decide_position_action(
+        side="yes",
+        entry_yes_prob=0.37,
+        mark_yes_prob=0.375,
+        stop_loss_prob=0.18,
+        take_profit_prob=0.20,
+        flip_side=None,
+        flip_min_edge=0.20,
+        seconds_to_close=3600,
+        time_stop_sec=120,
+        held_sec=901,
+        max_hold_sec=900,
+    )
+    assert d.action == "time_stop"
+
+
 def test_build_close_sells_yes_with_ask():
     body = build_close_v2_order(
         ticker="KXSOL15M-1",

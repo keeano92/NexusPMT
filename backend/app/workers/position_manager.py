@@ -38,11 +38,25 @@ def decide_position_action(
     flip_min_edge: float,
     seconds_to_close: float | None,
     time_stop_sec: float,
+    held_sec: float | None = None,
+    max_hold_sec: float | None = None,
 ) -> PositionDecision:
     side_l = (side or "yes").lower()
     if side_l not in {"yes", "no"}:
         side_l = "yes"
     pnl = _holder_pnl_prob(side_l, entry_yes_prob, mark_yes_prob)
+
+    if (
+        max_hold_sec is not None
+        and held_sec is not None
+        and held_sec >= max_hold_sec
+    ):
+        return PositionDecision(
+            action="time_stop",
+            reason=f"max_hold {held_sec:.0f}s ≥ {max_hold_sec:.0f}s pnl={pnl:+.3f}",
+            close_side=side_l,
+            pnl_prob=pnl,
+        )
 
     # Flip when underwater enough AND re-eval prefers the opposite side
     # (mirrors manual SOL: NO entry → YES cover after adverse move).

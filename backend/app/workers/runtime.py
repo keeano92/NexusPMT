@@ -83,6 +83,7 @@ class AutonomyRuntime:
         self._paper: PaperShadowBook | None = None
         self._last_wheel_ts: float = 0.0
         self._intel_by_series: dict[str, dict[str, Any]] = {}
+        self._last_paper_mark_log_ts: float = 0.0
 
     async def start(self) -> None:
         s = self.state.settings
@@ -1297,6 +1298,8 @@ class AutonomyRuntime:
     async def _manage_paper_positions(self) -> None:
         assert self._paper is not None
         s = self.state.settings
+        import time as _time
+
         for ticker, pos in list(self._paper.positions.items()):
             mark_yes = await self._fetch_mark_yes(ticker)
             if mark_yes is None:
@@ -1311,6 +1314,7 @@ class AutonomyRuntime:
             if s.kalshi_allow_flip:
                 flip_side = "no" if pos.side == "yes" else "yes"
             sec_left = await self._seconds_to_close(ticker)
+            held = _time.time() - float(pos.opened_ts or _time.time())
             decision = decide_position_action(
                 side=pos.side,
                 entry_yes_prob=pos.entry_yes_prob,
@@ -1321,8 +1325,22 @@ class AutonomyRuntime:
                 flip_min_edge=float(s.kalshi_flip_min_edge),
                 seconds_to_close=sec_left,
                 time_stop_sec=float(s.kalshi_time_stop_sec),
+                held_sec=held,
+                max_hold_sec=float(s.paper_max_hold_sec),
             )
+            # Heartbeat so the UI/terminal show paper is alive while holding
+            if _time.time() - self._last_paper_mark_log_ts >= 30:
+                self.state.terminal(
+                    (
+                        f"PAPER MARK {ticker} {pos.side.upper()} x{pos.qty} "
+                        f"entry={pos.entry_yes_prob:.2f} mark={mark_yes:.2f} "
+                        f"pnl={decision.pnl_prob:+.3f} held={held:.0f}s "
+                        f"eq=${self._paper.equity_cents()/100:.2f}"
+                    )[:180]
+                )
+                self._last_paper_mark_log_ts = _time.time()
             if decision.action == "hold":
+                await self.state.publish({"type": "paper", "paper": self._paper.snapshot()})
                 continue
             # Map flip → stop_loss for paper (no churn re-entry)
             status = decision.action if decision.action != "flip" else "stop_loss"

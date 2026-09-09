@@ -197,15 +197,39 @@
 
   function renderPortfolio(snap) {
     const root = $("portfolio");
-    const source = (snap.portfolio_source || "paper").toUpperCase();
-    const cash = money(snap.cash_cents != null ? snap.cash_cents : snap.paper_cash_cents);
-    const equity = snap.live_equity_cents != null ? money(snap.live_equity_cents) : null;
+    const paper = snap.paper;
+    const usingPaper = (snap.trading_mode || "paper") === "paper" && paper;
+    const source = usingPaper ? "PAPER SHADOW (live marks)" : (snap.portfolio_source || "paper").toUpperCase();
+    const cash = usingPaper
+      ? money(paper.cash_cents)
+      : money(snap.cash_cents != null ? snap.cash_cents : snap.paper_cash_cents);
+    const equity = usingPaper
+      ? money(paper.equity_cents)
+      : snap.live_equity_cents != null
+        ? money(snap.live_equity_cents)
+        : null;
     const posVal = snap.live_portfolio_value_cents != null ? money(snap.live_portfolio_value_cents) : null;
-    const realized = snap.live_realized_pnl_cents != null ? money(snap.live_realized_pnl_cents) : null;
-    const positions = snap.positions || [];
+    const realized = usingPaper
+      ? money(paper.realized_pnl_cents)
+      : snap.live_realized_pnl_cents != null
+        ? money(snap.live_realized_pnl_cents)
+        : null;
+    const positions = usingPaper
+      ? (paper.positions || []).map((p) => ({
+          ticker: p.ticker,
+          side: p.side,
+          qty: p.qty,
+          avg_price_cents: p.entry_price_cents,
+          mark: p.mark_yes_prob,
+        }))
+      : snap.positions || [];
     let html = `<div class="item"><strong>SOURCE: ${source}</strong>${snap.portfolio_updated_ts ? " · " + formatLocalTs(snap.portfolio_updated_ts) : ""}</div>`;
     html += `<div class="item">Cash: <strong>${cash}</strong></div>`;
-    if (source === "LIVE") {
+    if (usingPaper) {
+      html += `<div class="item">Paper equity: <strong>${equity}</strong> · session ${money(paper.session_pnl_cents)} · W/L ${paper.wins || 0}/${paper.losses || 0}</div>`;
+      html += `<div class="item">Gate: ${money(paper.equity_cents)} → ${money(paper.target_cents)} ${paper.gate_ready ? "✓ READY" : "(locked)"}</div>`;
+      if (realized) html += `<div class="item">Realized PnL: <strong>${realized}</strong></div>`;
+    } else if (source === "LIVE") {
       if (posVal) html += `<div class="item">Positions value: <strong>${posVal}</strong></div>`;
       if (equity) html += `<div class="item">Equity: <strong>${equity}</strong></div>`;
       if (realized) html += `<div class="item">Realized PnL: <strong>${realized}</strong></div>`;
@@ -216,7 +240,8 @@
       html += positions.map((p) => {
         const extra = p.exposure_cents != null ? ` · exp ${money(p.exposure_cents)}` : "";
         const rpnl = p.realized_pnl_cents != null ? ` · rPnL ${money(p.realized_pnl_cents)}` : "";
-        return `<div class="item">${p.ticker} · ${p.side} × ${p.qty} · avg ${p.avg_price_cents ?? "—"}¢${extra}${rpnl}</div>`;
+        const mk = p.mark != null ? ` · mark ${(Number(p.mark) * 100).toFixed(0)}¢` : "";
+        return `<div class="item">${p.ticker} · ${p.side} × ${p.qty} · avg ${p.avg_price_cents ?? "—"}¢${mk}${extra}${rpnl}</div>`;
       }).join("");
     }
     root.innerHTML = html;

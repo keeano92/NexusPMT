@@ -1,0 +1,36 @@
+{
+  "start_cents": 1000,
+  "target_cents": 10000,
+  "cash_cents": 519,
+  "peak_cents": 1007,
+  "closed_count": 0,
+  "wins": 0,
+  "losses": 0,
+  "realized_pnl_cents": 0,
+  "positions": {
+    "KXHIGHCHI-26SEP10-B77.5": {
+      "ticker": "KXHIGHCHI-26SEP10-B77.5",
+      "side": "yes",
+      "qty": 13,
+      "entry_yes_prob": 0.37,
+      "entry_price_cents": 37,
+      "exchange_index": 0,
+      "opened_ts": 1788971088.9229426,
+      "mark_yes_prob": 0.375
+    }
+  },
+  "fills": [
+    {
+      "ts": 1788971088.9229426,
+      "ticker": "KXHIGHCHI-26SEP10-B77.5",
+      "side": "yes",
+      "qty": 13,
+      "price_cents": 37,
+      "kind": "open",
+      "status": "filled",
+      "pnl_cents": 0,
+      "reason": "paper open vs live book"
+    }
+  ],
+  "series_cooldown_until": {}
+}

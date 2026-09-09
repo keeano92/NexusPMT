@@ -100,6 +100,8 @@ class Settings(BaseSettings):
     kalshi_min_net_edge: float = Field(default=0.06, alias="KALSHI_MIN_NET_EDGE")
     kalshi_position_poll_sec: float = Field(default=5.0, alias="KALSHI_POSITION_POLL_SEC")
     kalshi_time_stop_sec: float = Field(default=120.0, alias="KALSHI_TIME_STOP_SEC")
+    # Paper testing: force flat after this many seconds even if bands not hit
+    paper_max_hold_sec: float = Field(default=900.0, alias="PAPER_MAX_HOLD_SEC")
     kalshi_eval_batch_size: int = Field(default=4, alias="KALSHI_EVAL_BATCH_SIZE")
     kalshi_max_open_positions: int = Field(default=1, alias="KALSHI_MAX_OPEN_POSITIONS")
     kalshi_filter_mode: Literal["blocklist", "allowlist"] = Field(
