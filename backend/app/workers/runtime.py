@@ -377,6 +377,15 @@ class AutonomyRuntime:
                         continue
                 return 0.0
 
+            def _is_micro_horizon(ser: dict[str, Any]) -> bool:
+                """15m/hourly crypto is microstructure noise — deprioritize for ENTER."""
+                t = str(ser.get("ticker") or "").upper()
+                return any(tag in t for tag in ("15M", "1H", "5M", "10M", "30M"))
+
+            def _series_rank_key(ser: dict[str, Any]) -> tuple[int, float]:
+                # Prefer non-micro series, then volume
+                return (1 if _is_micro_horizon(ser) else 0, -_vol(ser))
+
             for cat in cats:
                 try:
                     series_resp = await self._kalshi.list_series(
@@ -389,16 +398,16 @@ class AutonomyRuntime:
                     for ser in (series_resp.get("series") or [])
                     if self.state.market_filter.allow_series(ser)
                 ]
-                cat_series.sort(key=_vol, reverse=True)
+                cat_series.sort(key=_series_rank_key)
                 # Crypto / Financials often live on non-zero shards — take more series
-                take = 8 if cat.lower() in {"crypto", "financials"} else 4
+                take = 10 if cat.lower() in {"crypto", "financials"} else 4
                 for ser in cat_series[:take]:
                     series_by[str(ser.get("ticker"))] = ser
                     ranked_series.append(ser)
                 await asyncio.sleep(0.12)
 
-            # Prefer higher volume overall, but keep category diversity
-            ranked_series.sort(key=_vol, reverse=True)
+            # Prefer non-micro then higher volume; keep category diversity
+            ranked_series.sort(key=_series_rank_key)
             # Pull markets for top series (avoid 429 + empty MVE dump)
             seen: set[str] = set()
             for ser in ranked_series[:28]:

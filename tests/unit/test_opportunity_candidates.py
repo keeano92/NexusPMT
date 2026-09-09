@@ -2,6 +2,46 @@ from backend.app.kalshi.market_filter import MarketFilter
 from backend.app.workers.opportunity_eval import collect_candidate_markets
 
 
+def test_collect_candidates_prefers_non_micro_over_15m():
+    mf = MarketFilter.from_settings(["crypto"], ["sports"], strict=True)
+    markets = [
+        {
+            "ticker": "BTC15M-1",
+            "title": "BTC up 15m",
+            "yes_bid_dollars": "0.48",
+            "yes_ask_dollars": "0.52",
+            "volume_fp": "999999",
+            "series_ticker": "KXBTC15M",
+            "event_ticker": "BTC15M-E",
+            "exchange_index": 2,
+        },
+        {
+            "ticker": "BTCMAX-1",
+            "title": "BTC max month",
+            "yes_bid_dollars": "0.44",
+            "yes_ask_dollars": "0.48",
+            "volume_fp": "1000",
+            "series_ticker": "KXBTCMAXMON",
+            "event_ticker": "BTCMAX-E",
+            "exchange_index": 2,
+        },
+    ]
+    series = {
+        "KXBTC15M": {"ticker": "KXBTC15M", "category": "Crypto", "title": "15m", "tags": []},
+        "KXBTCMAXMON": {
+            "ticker": "KXBTCMAXMON",
+            "category": "Crypto",
+            "title": "max",
+            "tags": [],
+        },
+    }
+    out = collect_candidate_markets(
+        markets, series, mf, max_spread=0.1, min_liquidity=0, funded_shards={2}
+    )
+    assert out[0]["ticker"] == "BTCMAX-1"
+    assert out[0]["micro_horizon"] is False
+
+
 def test_collect_candidates_skips_sports():
     mf = MarketFilter.from_settings(["economics", "politics"], ["sports"], strict=True)
     markets = [

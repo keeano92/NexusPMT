@@ -122,11 +122,15 @@ def collect_candidate_markets(
         liq = _liquidity(market)
         if min_liquidity > 0 and liq < min_liquidity:
             continue
+        series_ticker = str(
+            market.get("series_ticker") or (series or {}).get("ticker") or ""
+        )
+        micro = any(tag in series_ticker.upper() for tag in ("15M", "1H", "5M", "10M", "30M"))
         out.append(
             {
                 "ticker": market.get("ticker"),
                 "event_ticker": market.get("event_ticker"),
-                "series_ticker": market.get("series_ticker") or (series or {}).get("ticker"),
+                "series_ticker": series_ticker or None,
                 "title": market.get("title") or market.get("yes_sub_title"),
                 "yes_sub_title": market.get("yes_sub_title"),
                 "no_sub_title": market.get("no_sub_title"),
@@ -135,11 +139,17 @@ def collect_candidate_markets(
                 "spread": spread,
                 "liquidity": liq,
                 "exchange_index": exchange_index,
+                "micro_horizon": micro,
                 "raw": market,
             }
         )
-    # Prefer mid-range probs (more interesting)
-    out.sort(key=lambda m: abs(float(m["market_prob"]) - 0.5))
+    # Prefer non-microstructure, then mid-range probs (more interesting)
+    out.sort(
+        key=lambda m: (
+            1 if m.get("micro_horizon") else 0,
+            abs(float(m["market_prob"]) - 0.5),
+        )
+    )
     return out[:limit]
 
 
