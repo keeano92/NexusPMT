@@ -420,31 +420,43 @@ class AutonomyRuntime:
             self._recent_evals[ticker] = time.time()
             row = verdict.model_dump()
             evaluations.append(row)
+            # Stream into dashboard immediately (don't wait for full batch)
+            self.state.evaluations = (evaluations + [
+                e for e in self.state.evaluations if e.get("ticker") not in {x.get("ticker") for x in evaluations}
+            ])[:80]
             if verdict.verdict == "ENTER" and verdict.strength == "strong":
                 self.state.terminal(
                     f"ENTER {ticker} {verdict.side.upper()} VOI={verdict.value_of_interest:.2f} "
                     f"edge={verdict.edge:+.2%} :: {verdict.reason}"[:180]
                 )
-                enter_edges.append(
-                    EdgeCandidate(
-                        ticker=verdict.ticker,
-                        event_ticker=cand.get("event_ticker"),
-                        category=verdict.category,
-                        title=verdict.title,
-                        model_prob=verdict.model_prob if verdict.side == "yes" else 1.0 - verdict.model_prob,
-                        market_prob=verdict.market_prob,
-                        edge=abs(verdict.edge),
-                        side=verdict.side,
-                        liquidity=cand.get("liquidity"),
-                        action="buy_yes" if verdict.side == "yes" else "buy_no",
-                    ).model_dump()
-                )
+                edge_row = EdgeCandidate(
+                    ticker=verdict.ticker,
+                    event_ticker=cand.get("event_ticker"),
+                    category=verdict.category,
+                    title=verdict.title,
+                    model_prob=verdict.model_prob if verdict.side == "yes" else 1.0 - verdict.model_prob,
+                    market_prob=verdict.market_prob,
+                    edge=abs(verdict.edge),
+                    side=verdict.side,
+                    liquidity=cand.get("liquidity"),
+                    action="buy_yes" if verdict.side == "yes" else "buy_no",
+                ).model_dump()
+                enter_edges.append(edge_row)
+                self.state.edges = list(enter_edges)
             else:
                 self.state.terminal(
                     f"SKIP {ticker} VOI={verdict.value_of_interest:.2f} "
                     f"strength={verdict.strength} :: {verdict.reason}"[:180]
                 )
             await self.state.publish({"type": "terminal", "line": list(self.state.terminal_lines)[-1]})
+            await self.state.publish(
+                {
+                    "type": "edges",
+                    "edges": self.state.edges,
+                    "evaluations": self.state.evaluations[:40],
+                    "scanned_at": _iso(),
+                }
+            )
 
         # Keep legacy wheel cross-score as secondary signal when no ENTER yet
         if not enter_edges and self.state.wheel_nodes:
