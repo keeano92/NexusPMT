@@ -399,18 +399,54 @@ class AutonomyRuntime:
                     if self.state.market_filter.allow_series(ser)
                 ]
                 cat_series.sort(key=_series_rank_key)
-                # Crypto / Financials often live on non-zero shards — take more series
-                take = 10 if cat.lower() in {"crypto", "financials"} else 4
-                for ser in cat_series[:take]:
+                # Crypto / Financials often live on non-zero shards — take more series.
+                # Daily KXBTCD/KXBTC dominate volume but sit at extreme mids; force-include
+                # monthly MAXMON/MINMON so funded-shard scans have tradeable candidates.
+                if cat.lower() == "crypto":
+                    non_micro = [ser for ser in cat_series if not _is_micro_horizon(ser)]
+                    monthly = [
+                        ser
+                        for ser in non_micro
+                        if any(
+                            tag in str(ser.get("ticker") or "").upper()
+                            for tag in ("MAXMON", "MINMON", "MAXY", "MINY", "MAX150")
+                        )
+                    ]
+                    rest = [ser for ser in non_micro if ser not in monthly]
+                    micro = [ser for ser in cat_series if _is_micro_horizon(ser)]
+                    picked = monthly[:10] + rest[:6] + micro[:2]
+                elif cat.lower() == "financials":
+                    picked = cat_series[:10]
+                else:
+                    picked = cat_series[:4]
+                for ser in picked:
                     series_by[str(ser.get("ticker"))] = ser
                     ranked_series.append(ser)
                 await asyncio.sleep(0.12)
 
             # Prefer non-micro then higher volume; keep category diversity
             ranked_series.sort(key=_series_rank_key)
+            # Pin longer-horizon crypto series so volume giants (PRES/FED) don't
+            # push the only funded-shard tradeables out of the pull window.
+            pinned = [
+                ser
+                for ser in ranked_series
+                if any(
+                    tag in str(ser.get("ticker") or "").upper()
+                    for tag in ("MAXMON", "MINMON", "MAXY", "MINY", "MAX150")
+                )
+            ]
+            pull_series: list[dict[str, Any]] = []
+            seen_series: set[str] = set()
+            for ser in pinned + ranked_series:
+                st = str(ser.get("ticker") or "")
+                if not st or st in seen_series:
+                    continue
+                seen_series.add(st)
+                pull_series.append(ser)
             # Pull markets for top series (avoid 429 + empty MVE dump)
             seen: set[str] = set()
-            for ser in ranked_series[:28]:
+            for ser in pull_series[:36]:
                 st = str(ser.get("ticker") or "")
                 if not st:
                     continue
