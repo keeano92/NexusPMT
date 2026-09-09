@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
 from backend.app.kalshi.client import KalshiClient
 from backend.app.kalshi.models import EdgeCandidate, OrderIntent
 from backend.app.kalshi.portfolio import normalize_balance, normalize_positions
 from backend.app.state import AppState
+from backend.app.timeutil import local_iso
 from backend.app.workers.edge_engine import score_edges
 from backend.app.workers.futures_wheel import FuturesWheelEngine
 from backend.app.workers.opportunity_eval import (
@@ -24,7 +24,24 @@ logger = logging.getLogger(__name__)
 
 
 def _iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return local_iso()
+
+
+def _friendly_kalshi_error(exc: Exception) -> str:
+    text = str(exc)
+    if "410" in text and "Gone" in text:
+        return (
+            "Kalshi order API 410 Gone — legacy /portfolio/orders retired; "
+            "use Create Order V2 /portfolio/events/orders"
+        )
+    if "401" in text:
+        return "Kalshi auth failed (401) — check key/env match (demo keys ≠ production)"
+    if "429" in text:
+        return "Kalshi rate limited (429) — backing off"
+    if "400" in text:
+        return f"Kalshi rejected order (400): {text[:180]}"
+    # Keep short for ledger readability
+    return text.split("For more information")[0].strip()[:220]
 
 
 class AutonomyRuntime:
@@ -575,27 +592,22 @@ class AutonomyRuntime:
             )
             return False
 
-        # Strong wheel/xAI entries: allocate ~90% of this env book's available cash
+        # Strong wheel/xAI entries: allocate ~90% of this env book's available cash.
+        # yes_price is always the YES-book limit (cents). Buying NO = ask YES at that price.
         yes_price = int(round(float(edge.get("market_prob", 0.5)) * 100))
-        if edge.get("side") == "no":
-            yes_price = max(1, 100 - yes_price)
         yes_price = min(99, max(1, yes_price))
+        pay_cents = yes_price if edge.get("side") != "no" else max(1, 100 - yes_price)
         cash = max(0, self.state.book().cash_cents())
         alloc = int(cash * float(s.kalshi_strong_allocation_pct))
         if alloc <= 0:
             self.state.terminal(f"SKIP {ticker} — no cash in book {self.state.active_book_key}")
             return False
-        count = max(1, alloc // yes_price)
-        # Hard safety cap still applies unless allocation is intentionally high for overnight
-        max_by_cap = max(1, int(s.kalshi_max_notional_cents) // yes_price)
-        # Prefer strong allocation, but never exceed cash
-        count = min(count, max(1, cash // yes_price))
-        # If max_notional is tiny vs 90% intent, allow up to allocation (user asked for 90%)
-        if int(s.kalshi_max_notional_cents) < alloc:
-            count = max(count, max_by_cap) if max_by_cap < count else count
-        notional = yes_price * count
+        count = max(1, alloc // pay_cents)
+        count = min(count, max(1, cash // pay_cents))
+        notional = pay_cents * count
         self.state.terminal(
-            f"SIZE {ticker} cash={cash}¢ alloc={alloc}¢ px={yes_price}¢ qty={count} notional={notional}¢"
+            f"SIZE {ticker} {edge.get('side')} cash={cash}¢ alloc={alloc}¢ "
+            f"yes_px={yes_price}¢ pay={pay_cents}¢ qty={count} notional={notional}¢"
         )
 
         intent = OrderIntent(
@@ -641,16 +653,19 @@ class AutonomyRuntime:
             return True
 
         try:
-            body = {
-                "ticker": intent.ticker,
-                "side": intent.side,
-                "action": "buy",
-                "count": intent.count,
-                "type": "limit",
-                "yes_price": intent.yes_price,
-                "client_order_id": intent.client_order_id,
-            }
+            # Ensure UUID-shaped client_order_id for Kalshi V2
+            coid = intent.client_order_id
+            if len(coid) < 32 or coid.count("-") < 4:
+                coid = str(uuid.uuid4())
+            body = KalshiClient.build_v2_order(
+                ticker=intent.ticker,
+                side=intent.side,
+                count=intent.count,
+                yes_price_cents=int(intent.yes_price or 50),
+                client_order_id=coid,
+            )
             resp = await self._kalshi.create_order(body)
+            oid = (resp or {}).get("order_id") if isinstance(resp, dict) else None
             self.state.ledger.append(
                 kind="order",
                 ticker=ticker,
@@ -659,8 +674,8 @@ class AutonomyRuntime:
                 price_cents=intent.yes_price,
                 mode="live",
                 status="submitted",
-                message="Live order submitted (wheel-driven)",
-                meta={"response": resp, "edge": edge.get("edge")},
+                message=f"Live order submitted (V2){f' id={oid}' if oid else ''}",
+                meta={"response": resp, "edge": edge.get("edge"), "request": body},
             )
             self.state.failsafes.record_api_success()
             self._recent_trades[ticker] = time.time()
@@ -669,13 +684,19 @@ class AutonomyRuntime:
             return True
         except Exception as exc:
             self.state.failsafes.record_api_error()
+            friendly = _friendly_kalshi_error(exc)
             self.state.ledger.append(
                 kind="order",
                 ticker=ticker,
+                side=intent.side,
+                qty=intent.count,
+                price_cents=intent.yes_price,
                 mode="live",
                 status="error",
-                message=str(exc),
+                message=friendly,
+                meta={"error": str(exc)},
             )
+            self.state.terminal(f"ORDER ERROR {ticker}: {friendly}")
             await self.state.publish({"type": "ledger"})
             return False
 

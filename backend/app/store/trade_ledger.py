@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Deque, Literal
+
+from backend.app.timeutil import format_ledger_ts, local_iso
 
 
 LedgerKind = Literal["order", "fill", "control", "filter", "system"]
@@ -39,7 +40,7 @@ class TradeLedger:
             self._seq += 1
             entry = LedgerEntry(
                 id=kwargs.pop("id", f"led-{self._seq}"),
-                ts=kwargs.pop("ts", datetime.now(timezone.utc).isoformat()),
+                ts=kwargs.pop("ts", local_iso()),
                 kind=kwargs.pop("kind", "system"),
                 **kwargs,
             )
@@ -62,7 +63,9 @@ class TradeLedger:
                 continue
             if ticker and e.ticker != ticker:
                 continue
-            out.append(asdict(e))
+            row = asdict(e)
+            row["ts_display"] = format_ledger_ts(e.ts)
+            out.append(row)
             if len(out) >= limit:
                 break
         return out

@@ -72,4 +72,38 @@ class KalshiClient:
         return await self.request("GET", "/markets", params=params or None, auth=bool(self.api_key_id))
 
     async def create_order(self, body: dict[str, Any]) -> dict[str, Any]:
-        return await self.request("POST", "/portfolio/orders", json=body)
+        """Place order via Create Order V2 (`/portfolio/events/orders`).
+
+        Legacy `/portfolio/orders` returns HTTP 410 Gone.
+        """
+        return await self.request("POST", "/portfolio/events/orders", json=body)
+
+    @staticmethod
+    def build_v2_order(
+        *,
+        ticker: str,
+        side: str,
+        count: int,
+        yes_price_cents: int,
+        client_order_id: str,
+    ) -> dict[str, Any]:
+        """Map yes/no buy intent → V2 bid/ask + fixed-point dollar price."""
+        # V2 quotes the YES book only: bid=buy YES, ask=sell YES (= buy NO).
+        side_l = (side or "yes").lower()
+        px = max(1, min(99, int(yes_price_cents)))
+        if side_l == "no":
+            # Buying NO at (100-px)¢ YES-equivalent → ask YES at px
+            book_side = "ask"
+            yes_px = px  # YES limit when selling YES / buying NO
+        else:
+            book_side = "bid"
+            yes_px = px
+        return {
+            "ticker": ticker,
+            "side": book_side,
+            "count": f"{int(count)}.00",
+            "price": f"{yes_px / 100:.4f}",
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
+            "client_order_id": client_order_id,
+        }

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
 from threading import Lock
 from typing import Any
+
+from backend.app.timeutil import local_iso
 
 
 class FailSafeState(str, Enum):
@@ -24,7 +25,7 @@ class AuditEvent:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return local_iso()
 
 
 class FailSafeController:

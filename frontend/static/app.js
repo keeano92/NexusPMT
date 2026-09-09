@@ -152,14 +152,34 @@
     });
   }
 
+  function formatLocalTs(ts) {
+    if (!ts) return "";
+    try {
+      const d = new Date(ts);
+      if (!Number.isNaN(d.getTime())) {
+        return d.toLocaleString(undefined, {
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hour12: false,
+        });
+      }
+    } catch (_) { /* fall through */ }
+    return String(ts).replace("T", " ").slice(0, 19);
+  }
+
   function renderLedger(rows) {
     const body = $("ledgerBody");
     body.innerHTML = "";
     (rows || []).forEach((r) => {
       const tr = document.createElement("tr");
-      const t = (r.ts || "").replace("T", " ").slice(0, 19);
+      const t = r.ts_display || formatLocalTs(r.ts);
+      const msg = (r.message || "").replace(/</g, "&lt;");
       tr.innerHTML = `<td>${t}</td><td>${r.kind}</td><td>${r.ticker || ""}</td><td>${r.side || ""}</td>
-        <td>${r.qty ?? ""}</td><td>${r.price_cents ?? ""}</td><td>${r.mode || ""}</td><td>${r.status}</td><td>${r.message || ""}</td>`;
+        <td>${r.qty ?? ""}</td><td>${r.price_cents ?? ""}</td><td>${r.mode || ""}</td><td>${r.status}</td><td title="${msg}">${msg}</td>`;
       body.appendChild(tr);
     });
   }
@@ -172,7 +192,7 @@
     const posVal = snap.live_portfolio_value_cents != null ? money(snap.live_portfolio_value_cents) : null;
     const realized = snap.live_realized_pnl_cents != null ? money(snap.live_realized_pnl_cents) : null;
     const positions = snap.positions || [];
-    let html = `<div class="item"><strong>SOURCE: ${source}</strong>${snap.portfolio_updated_ts ? " · " + snap.portfolio_updated_ts : ""}</div>`;
+    let html = `<div class="item"><strong>SOURCE: ${source}</strong>${snap.portfolio_updated_ts ? " · " + formatLocalTs(snap.portfolio_updated_ts) : ""}</div>`;
     html += `<div class="item">Cash: <strong>${cash}</strong></div>`;
     if (source === "LIVE") {
       if (posVal) html += `<div class="item">Positions value: <strong>${posVal}</strong></div>`;

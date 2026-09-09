@@ -135,10 +135,9 @@ class AppState:
         self.book().portfolio_updated_ts = value
 
     def terminal(self, line: str) -> None:
-        from datetime import datetime, timezone
+        from backend.app.timeutil import local_clock
 
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        msg = f"[{ts}] {line}"
+        msg = f"[{local_clock()}] {line}"
         self.terminal_lines.append(msg)
 
     def set_worldmap_ready(self, ready: bool, reason: str = "") -> None:
