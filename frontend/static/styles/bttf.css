@@ -34,6 +34,50 @@ html, body {
   opacity: 0.35;
 }
 
+.wm-blocker {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.25rem;
+  background: rgba(6, 8, 14, 0.88);
+  backdrop-filter: blur(4px);
+}
+.wm-blocker.hidden { display: none; }
+.wm-blocker-card {
+  max-width: 34rem;
+  width: 100%;
+  border: 1px solid var(--magenta);
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 1.25rem 1.35rem;
+  box-shadow: 0 0 40px rgba(255, 43, 214, 0.25);
+}
+.wm-blocker-card h1 {
+  margin: 0 0 0.65rem;
+  letter-spacing: 0.14em;
+  color: var(--magenta);
+  font-size: 1.1rem;
+}
+.wm-blocker-card p { margin: 0 0 0.55rem; color: #e8f6ff; }
+.wm-sub { color: var(--steel) !important; font-size: 0.85rem; }
+.wm-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.55rem;
+  margin: 1rem 0 0.75rem;
+}
+.wm-detail {
+  margin: 0;
+  max-height: 8rem;
+  overflow: auto;
+  font-size: 0.7rem;
+  color: var(--steel);
+  white-space: pre-wrap;
+}
+
 .topbar {
   display: flex;
   flex-wrap: wrap;

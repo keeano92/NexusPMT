@@ -30,6 +30,15 @@ class Settings(BaseSettings):
         alias="WORLDMAP_HEALTH_PATH",
     )
     worldmap_poll_interval_sec: float = Field(default=30.0, alias="WORLDMAP_POLL_INTERVAL_SEC")
+    worldmap_required: bool = Field(default=True, alias="WORLDMAP_REQUIRED")
+    worldmap_container_name: str = Field(
+        default="sk-ai-worldmap",
+        alias="WORLDMAP_CONTAINER_NAME",
+    )
+    worldmap_compose_project: str = Field(
+        default="sk-ai-worldmap",
+        alias="WORLDMAP_COMPOSE_PROJECT",
+    )
 
     kalshi_key_id: str = Field(default="", alias="KALSHI_KEY_ID")
     kalshi_private_key_path: str = Field(

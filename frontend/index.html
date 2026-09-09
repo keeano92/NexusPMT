@@ -10,6 +10,18 @@
 </head>
 <body>
   <div class="scanlines" aria-hidden="true"></div>
+  <div id="wmBlocker" class="wm-blocker hidden" role="alert">
+    <div class="wm-blocker-card">
+      <h1>WORLDMAP REQUIRED</h1>
+      <p id="wmBlockReason">NexusPMT cannot run without SK AI WorldMap telemetry.</p>
+      <p class="wm-sub">Futures Wheel, edge scoring, and trading stay locked until WorldMap sidecar-health returns 200.</p>
+      <div class="wm-actions">
+        <button class="btn kill" id="btnStartWm" type="button">FORCE START WORLDMAP</button>
+        <button class="btn warn" id="btnRecheckWm" type="button">RECHECK</button>
+      </div>
+      <pre id="wmBlockDetail" class="wm-detail"></pre>
+    </div>
+  </div>
   <header class="topbar">
     <div class="brand">
       <span class="flux">NEXUS</span><span class="amber">PMT</span>

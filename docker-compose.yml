@@ -18,6 +18,8 @@ services:
       - "${NEXUSPMT_PUBLISH_PORT:-8088}:8080"
     volumes:
       - ./secrets/kalshi_private.pem:/run/secrets/kalshi_private.pem:ro
+      # Allows FORCE START WORLDMAP from the operator UI (Docker Desktop / Linux)
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - somykida_net
     restart: unless-stopped

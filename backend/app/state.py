@@ -25,10 +25,35 @@ class AppState:
     edges: list[dict[str, Any]] = field(default_factory=list)
     positions: list[dict[str, Any]] = field(default_factory=list)
     worldmap_health: dict[str, Any] = field(default_factory=dict)
+    worldmap_ready: bool = False
+    worldmap_block_reason: str = "Waiting for SK AI WorldMap liveness"
+    worldmap_paused_autonomy: bool = False
     last_ingest_ts: str | None = None
     paper_cash_cents: int = 100_000  # $1000 paper starting cash
     paper_positions: dict[str, dict[str, Any]] = field(default_factory=dict)
     bus_subscribers: set[asyncio.Queue] = field(default_factory=set)
+
+    def set_worldmap_ready(self, ready: bool, reason: str = "") -> None:
+        was_ready = self.worldmap_ready
+        self.worldmap_ready = ready
+        self.worldmap_block_reason = "" if ready else (reason or "SK AI WorldMap required but unreachable")
+        if (
+            not ready
+            and self.settings.worldmap_required
+            and was_ready
+            and self.failsafes.can_place_orders()
+        ):
+            # Hard couple: autonomy cannot place orders without WorldMap intel
+            self.failsafes.pause(actor="worldmap_gate")
+            self.worldmap_paused_autonomy = True
+            self.ledger.append(
+                kind="system",
+                status="blocked",
+                message="WorldMap lost — autonomy paused",
+            )
+        if not ready and self.settings.worldmap_required and not was_ready:
+            # Initial boot / still down: ensure we do not trade
+            self.worldmap_paused_autonomy = True
 
     async def publish(self, event: dict[str, Any]) -> None:
         dead: list[asyncio.Queue] = []
@@ -53,6 +78,9 @@ class AppState:
             "ledger": self.ledger.list(limit=100),
             "positions": self.positions,
             "worldmap_health": self.worldmap_health,
+            "worldmap_ready": self.worldmap_ready,
+            "worldmap_required": self.settings.worldmap_required,
+            "worldmap_block_reason": self.worldmap_block_reason,
             "last_ingest_ts": self.last_ingest_ts,
             "paper_cash_cents": self.paper_cash_cents,
         }

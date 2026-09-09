@@ -95,15 +95,68 @@ class AutonomyRuntime:
                     **(compact if isinstance(compact, dict) else {}),
                 }
 
+                if self.state.settings.worldmap_required and code != 200:
+                    was_ready = self.state.worldmap_ready
+                    self.state.set_worldmap_ready(
+                        False,
+                        "SK AI WorldMap is down or unreachable. NexusPMT cannot trade or build "
+                        "a Futures Wheel without WorldMap telemetry. Use FORCE START WORLDMAP.",
+                    )
+                    self.state.wheel_nodes = []
+                    self.state.edges = []
+                    self.state.intel_snippets = []
+                    if was_ready:
+                        self.state.ledger.append(
+                            kind="system",
+                            status="blocked",
+                            message="WorldMap required — autonomy blocked until sidecar-health returns 200",
+                        )
+                    await self.state.publish(
+                        {
+                            "type": "worldmap",
+                            "worldmap_ready": False,
+                            "worldmap_block_reason": self.state.worldmap_block_reason,
+                            "worldmap_health": self.state.worldmap_health,
+                        }
+                    )
+                    continue
+
                 snippets: list[str] = []
                 try:
                     boot = await self._wm.bootstrap()
                     snippets.extend(self._snippets_from_bootstrap(boot))
                 except Exception as exc:
                     logger.warning("bootstrap failed: %s", exc)
-                    snippets.append(
-                        "WorldMap bootstrap unavailable — using local macro fallback intel"
-                    )
+                    if self.state.settings.worldmap_required:
+                        self.state.set_worldmap_ready(
+                            False,
+                            f"WorldMap liveness OK but bootstrap failed: {exc}",
+                        )
+                        self.state.wheel_nodes = []
+                        self.state.edges = []
+                        await self.state.publish(
+                            {
+                                "type": "worldmap",
+                                "worldmap_ready": False,
+                                "worldmap_block_reason": self.state.worldmap_block_reason,
+                            }
+                        )
+                        continue
+                    snippets.append("WorldMap bootstrap unavailable")
+
+                # WorldMap is healthy + bootstrap usable
+                was_down = not self.state.worldmap_ready
+                self.state.set_worldmap_ready(True)
+                if was_down and self.state.worldmap_paused_autonomy:
+                    snap = self.state.failsafes.snapshot()
+                    if snap["state"] == "paused":
+                        self.state.failsafes.resume(actor="worldmap_gate")
+                        self.state.ledger.append(
+                            kind="system",
+                            status="resumed",
+                            message="WorldMap restored — autonomy resumed",
+                        )
+                    self.state.worldmap_paused_autonomy = False
 
                 self.state.intel_snippets = snippets[-100:]
                 query = self._pick_query(snippets)
@@ -111,15 +164,23 @@ class AutonomyRuntime:
                 self.state.wheel_nodes = [n.model_dump() for n in wheel.nodes]
                 self.state.last_ingest_ts = _iso()
                 await self.state.publish({"type": "wheel", "nodes": self.state.wheel_nodes})
+                await self.state.publish(
+                    {
+                        "type": "worldmap",
+                        "worldmap_ready": True,
+                        "worldmap_health": self.state.worldmap_health,
+                    }
+                )
 
                 await self._refresh_edges(wheel.nodes)
-                if code == 200:
-                    self.state.failsafes.record_api_success()
+                self.state.failsafes.record_api_success()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("ingest loop error")
                 self.state.failsafes.record_api_error()
+                if self.state.settings.worldmap_required:
+                    self.state.set_worldmap_ready(False, "Ingest loop error while WorldMap required")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
@@ -191,7 +252,11 @@ class AutonomyRuntime:
     async def _trade_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                if self.state.failsafes.can_place_orders() and self.state.edges:
+                if (
+                    self.state.worldmap_ready
+                    and self.state.failsafes.can_place_orders()
+                    and self.state.edges
+                ):
                     await self._maybe_trade(self.state.edges[0])
             except asyncio.CancelledError:
                 raise
@@ -204,6 +269,8 @@ class AutonomyRuntime:
 
     async def _maybe_trade(self, edge: dict[str, Any]) -> None:
         s = self.state.settings
+        if s.worldmap_required and not self.state.worldmap_ready:
+            return
         if edge.get("action") == "skip":
             return
         ticker = edge["ticker"]

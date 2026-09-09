@@ -26,13 +26,42 @@
     el.className = "pill " + (cls || "");
   }
 
+  function renderWorldmapGate(snap) {
+    const blocker = $("wmBlocker");
+    const required = snap.worldmap_required !== false;
+    const ready = !!snap.worldmap_ready;
+    if (required && !ready) {
+      blocker.classList.remove("hidden");
+      $("wmBlockReason").textContent =
+        snap.worldmap_block_reason ||
+        "NexusPMT cannot run without SK AI WorldMap telemetry.";
+      $("wmBlockDetail").textContent = JSON.stringify(
+        {
+          sidecar_status: snap.worldmap_health?.sidecar_status,
+          status: snap.worldmap_health?.status,
+          error: snap.worldmap_health?.error,
+        },
+        null,
+        2
+      );
+    } else {
+      blocker.classList.add("hidden");
+    }
+  }
+
   function renderPills(snap) {
     setPill($("pillMode"), (snap.trading_mode || "paper").toUpperCase(), snap.trading_mode === "live" ? "bad" : "warn");
     setPill($("pillEnv"), (snap.kalshi_env || "demo").toUpperCase());
     const fs = snap.failsafes?.state || "unknown";
     setPill($("pillFs"), fs.toUpperCase(), fs === "running" ? "ok" : fs === "paused" ? "warn" : "bad");
+    const ready = !!snap.worldmap_ready;
     const wm = snap.worldmap_health?.status || snap.worldmap_health?.sidecar_status || "…";
-    setPill($("pillWm"), "WM " + wm, wm === 200 || wm === "HEALTHY" ? "ok" : "warn");
+    setPill(
+      $("pillWm"),
+      ready ? "WM READY" : "WM DOWN",
+      ready || wm === 200 || wm === "HEALTHY" ? "ok" : "bad"
+    );
+    renderWorldmapGate(snap);
   }
 
   function renderDaily(snap) {
@@ -185,10 +214,24 @@
         updateChart();
       } else if (msg.type === "wheel") renderWheel(msg.nodes);
       else if (msg.type === "edges") renderEdges(msg.edges);
-      else if (msg.type === "ledger" || msg.type === "failsafes") refresh();
+      else if (msg.type === "worldmap") {
+        if (msg.worldmap_ready === false || msg.worldmap_ready === true) {
+          refresh();
+        } else if (msg.start_result) {
+          $("wmBlockDetail").textContent = JSON.stringify(msg.start_result, null, 2);
+          refresh();
+        }
+      } else if (msg.type === "ledger" || msg.type === "failsafes") refresh();
     };
     ws.onclose = () => setTimeout(connectWs, 2000);
   }
+
+  $("btnStartWm").onclick = async () => {
+    $("wmBlockDetail").textContent = "Starting WorldMap container…";
+    await control("/api/controls/start-worldmap");
+    setTimeout(() => refresh().catch(console.error), 3000);
+  };
+  $("btnRecheckWm").onclick = () => refresh().catch(console.error);
 
   refresh().catch(console.error);
   connectWs();

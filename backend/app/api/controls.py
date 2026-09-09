@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 
 from backend.app.api.deps import require_operator
+from backend.app.worldmap.lifecycle import container_status, start_worldmap
 
 router = APIRouter(tags=["controls"], prefix="/api/controls")
 
@@ -102,3 +103,39 @@ async def reject(
 ) -> dict:
     order = request.app.state.state.failsafes.reject(body.client_order_id, actor=actor)
     return {"ok": order is not None, "order": order}
+
+
+@router.get("/worldmap")
+async def worldmap_status(request: Request) -> dict:
+    state = request.app.state.state
+    settings = state.settings
+    docker = await container_status(settings.worldmap_container_name)
+    return {
+        "worldmap_ready": state.worldmap_ready,
+        "worldmap_required": settings.worldmap_required,
+        "worldmap_block_reason": state.worldmap_block_reason,
+        "worldmap_health": state.worldmap_health,
+        "health_url": settings.worldmap_health_url,
+        "container": docker,
+    }
+
+
+@router.post("/start-worldmap")
+async def force_start_worldmap(
+    request: Request,
+    actor: str = Depends(require_operator),
+) -> dict:
+    state = request.app.state.state
+    settings = state.settings
+    result = await start_worldmap(
+        settings.worldmap_container_name,
+        settings.worldmap_compose_project,
+    )
+    state.ledger.append(
+        kind="control",
+        status="start_worldmap",
+        message=f"Force start WorldMap by {actor}: {result.get('action')} ok={result.get('ok')}",
+        meta=result,
+    )
+    await state.publish({"type": "worldmap", "start_result": result})
+    return result
