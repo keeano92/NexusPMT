@@ -7,7 +7,12 @@ router = APIRouter(tags=["dashboard"])
 
 @router.get("/api/dashboard")
 async def dashboard(request: Request) -> dict:
-    return request.app.state.state.dashboard_snapshot()
+    snap = request.app.state.state.dashboard_snapshot()
+    runtime = getattr(request.app.state, "runtime", None)
+    paper = getattr(runtime, "_paper", None) if runtime else None
+    if paper is not None:
+        snap["paper"] = paper.snapshot()
+    return snap
 
 
 @router.get("/api/pnl")

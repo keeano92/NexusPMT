@@ -270,6 +270,11 @@ def collect_candidate_markets(
 
 
 class OpportunityEvaluator:
+    # Process-wide breaker so one 403 stops the burn for the whole session.
+    _llm_circuit_open: bool = False
+    _llm_circuit_reason: str = ""
+    _llm_calls_hour: list[float] = []
+
     def __init__(
         self,
         *,
@@ -279,13 +284,32 @@ class OpportunityEvaluator:
         enter_voi_threshold: float = 0.28,
         require_strong_enter: bool = False,
         min_edge: float = 0.03,
+        xai_enabled: bool = False,
+        max_calls_per_hour: int = 10,
     ) -> None:
         self.model = model
         self.enter_voi_threshold = enter_voi_threshold
         self.require_strong_enter = require_strong_enter
         self.min_edge = min_edge
+        self.xai_enabled = bool(xai_enabled)
+        self.max_calls_per_hour = max(0, int(max_calls_per_hour))
         self._client = AsyncOpenAI(api_key=api_key or "missing", base_url=base_url)
         self._llm_disabled_reason: str | None = None
+
+    def _llm_allowed(self) -> bool:
+        if not self.xai_enabled:
+            return False
+        if OpportunityEvaluator._llm_circuit_open:
+            return False
+        if not self._client.api_key or self._client.api_key == "missing":
+            return False
+        import time
+
+        now = time.time()
+        OpportunityEvaluator._llm_calls_hour = [
+            t for t in OpportunityEvaluator._llm_calls_hour if now - t < 3600
+        ]
+        return len(OpportunityEvaluator._llm_calls_hour) < self.max_calls_per_hour
 
     async def evaluate(
         self,
@@ -326,14 +350,20 @@ class OpportunityEvaluator:
             ),
         }
 
-        if not self._client.api_key or self._client.api_key == "missing":
-            return odds_heuristic_verdict(
+        if not self._llm_allowed():
+            reason = OpportunityEvaluator._llm_circuit_reason or "xai_disabled"
+            v = odds_heuristic_verdict(
                 candidate,
                 enter_voi_threshold=self.enter_voi_threshold,
                 min_edge=self.min_edge,
             )
+            v.reason = f"{v.reason} ({reason})"
+            return v
 
         try:
+            import time
+
+            OpportunityEvaluator._llm_calls_hour.append(time.time())
             try:
                 resp = await self._client.chat.completions.create(
                     model=self.model,
@@ -387,7 +417,11 @@ class OpportunityEvaluator:
             self._llm_disabled_reason = None
             return verdict
         except Exception as exc:
-            # Credits / network — fall back to odds heuristic that CAN enter
+            msg = str(exc)
+            if "403" in msg or "429" in msg or "permission-denied" in msg.lower() or "spending limit" in msg.lower():
+                OpportunityEvaluator._llm_circuit_open = True
+                OpportunityEvaluator._llm_circuit_reason = f"circuit_open:{type(exc).__name__}"
+                logger.error("xAI circuit OPEN — disabling further LLM calls (%s)", exc)
             self._llm_disabled_reason = f"{type(exc).__name__}: {exc}"
             logger.warning("opportunity eval LLM failed for %s: %s", ticker, exc)
             v = odds_heuristic_verdict(

@@ -50,6 +50,14 @@ class Settings(BaseSettings):
         default="paper",
         alias="KALSHI_TRADING_MODE",
     )
+    # Hard gate: live auto-orders require explicit unlock after paper $10→$100
+    live_unlock: bool = Field(default=False, alias="LIVE_UNLOCK")
+    paper_start_cents: int = Field(default=1000, alias="PAPER_START_CENTS")
+    paper_target_cents: int = Field(default=10000, alias="PAPER_TARGET_CENTS")
+    paper_state_path: str = Field(
+        default="data/paper_shadow_book.json",
+        alias="PAPER_STATE_PATH",
+    )
     kalshi_sports_filter: Literal["strict", "off"] = Field(
         default="strict",
         alias="KALSHI_SPORTS_FILTER",
@@ -69,7 +77,6 @@ class Settings(BaseSettings):
     kalshi_max_spread: float = Field(default=0.08, alias="KALSHI_MAX_SPREAD")
     kalshi_min_liquidity: float = Field(default=0.0, alias="KALSHI_MIN_LIQUIDITY")
     kalshi_max_notional_cents: int = Field(default=2500, alias="KALSHI_MAX_NOTIONAL_CENTS")
-    kalshi_max_open_positions: int = Field(default=10, alias="KALSHI_MAX_OPEN_POSITIONS")
     kalshi_require_approval_above_cents: int = Field(
         default=50000,
         alias="KALSHI_REQUIRE_APPROVAL_ABOVE_CENTS",
@@ -85,13 +92,16 @@ class Settings(BaseSettings):
         default=False,
         alias="KALSHI_REQUIRE_STRONG_ENTER",
     )
-    kalshi_prefer_15m: bool = Field(default=True, alias="KALSHI_PREFER_15M")
-    kalshi_stop_loss_prob: float = Field(default=0.10, alias="KALSHI_STOP_LOSS_PROB")
-    kalshi_take_profit_prob: float = Field(default=0.15, alias="KALSHI_TAKE_PROFIT_PROB")
-    kalshi_flip_min_edge: float = Field(default=0.05, alias="KALSHI_FLIP_MIN_EDGE")
-    kalshi_position_poll_sec: float = Field(default=4.0, alias="KALSHI_POSITION_POLL_SEC")
-    kalshi_time_stop_sec: float = Field(default=90.0, alias="KALSHI_TIME_STOP_SEC")
+    kalshi_prefer_15m: bool = Field(default=False, alias="KALSHI_PREFER_15M")
+    kalshi_stop_loss_prob: float = Field(default=0.18, alias="KALSHI_STOP_LOSS_PROB")
+    kalshi_take_profit_prob: float = Field(default=0.20, alias="KALSHI_TAKE_PROFIT_PROB")
+    kalshi_flip_min_edge: float = Field(default=0.20, alias="KALSHI_FLIP_MIN_EDGE")
+    kalshi_allow_flip: bool = Field(default=False, alias="KALSHI_ALLOW_FLIP")
+    kalshi_min_net_edge: float = Field(default=0.06, alias="KALSHI_MIN_NET_EDGE")
+    kalshi_position_poll_sec: float = Field(default=5.0, alias="KALSHI_POSITION_POLL_SEC")
+    kalshi_time_stop_sec: float = Field(default=120.0, alias="KALSHI_TIME_STOP_SEC")
     kalshi_eval_batch_size: int = Field(default=4, alias="KALSHI_EVAL_BATCH_SIZE")
+    kalshi_max_open_positions: int = Field(default=1, alias="KALSHI_MAX_OPEN_POSITIONS")
     kalshi_filter_mode: Literal["blocklist", "allowlist"] = Field(
         default="blocklist",
         alias="KALSHI_FILTER_MODE",
@@ -104,9 +114,24 @@ class Settings(BaseSettings):
     xai_api_key: str = Field(default="", alias="XAI_API_KEY")
     xai_base_url: str = Field(default="https://api.x.ai/v1", alias="XAI_BASE_URL")
     xai_model: str = Field(default="grok-4.6", alias="XAI_MODEL")
+    xai_enabled: bool = Field(default=False, alias="XAI_ENABLED")
+    xai_max_calls_per_hour: int = Field(default=10, alias="XAI_MAX_CALLS_PER_HOUR")
+    xai_wheel_min_interval_sec: float = Field(
+        default=900.0,
+        alias="XAI_WHEEL_MIN_INTERVAL_SEC",
+    )
+
+    # Cheap intel: none | brave | serp | gemini (official APIs only — no UI scraping)
+    intel_provider: Literal["none", "brave", "serp", "gemini"] = Field(
+        default="none",
+        alias="INTEL_PROVIDER",
+    )
+    intel_api_key: str = Field(default="", alias="INTEL_API_KEY")
+    gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
+    gemini_model: str = Field(default="gemini-2.0-flash", alias="GEMINI_MODEL")
 
     risk_max_daily_loss_cents: int = Field(default=5000, alias="RISK_MAX_DAILY_LOSS_CENTS")
-    risk_max_drawdown_pct: float = Field(default=15.0, alias="RISK_MAX_DRAWDOWN_PCT")
+    risk_max_drawdown_pct: float = Field(default=55.0, alias="RISK_MAX_DRAWDOWN_PCT")
     risk_auto_kill_on_errors: int = Field(default=5, alias="RISK_AUTO_KILL_ON_ERRORS")
 
     @property

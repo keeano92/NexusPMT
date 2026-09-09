@@ -32,6 +32,9 @@ from backend.app.workers.position_manager import (
     build_close_v2_order,
     decide_position_action,
 )
+from backend.app.workers.ranker import rank_candidates
+from backend.app.store.paper_shadow import PaperShadowBook
+from backend.app.intel.search_brief import fetch_intel_brief
 from backend.app.worldmap.client import WorldMapClient
 
 logger = logging.getLogger(__name__)
@@ -77,6 +80,9 @@ class AutonomyRuntime:
         self._soft_reject_cycle: bool = False
         # ticker -> {side, entry_yes_prob, exchange_index, opened_ts}
         self._entry_marks: dict[str, dict[str, Any]] = {}
+        self._paper: PaperShadowBook | None = None
+        self._last_wheel_ts: float = 0.0
+        self._intel_by_series: dict[str, dict[str, Any]] = {}
 
     async def start(self) -> None:
         s = self.state.settings
@@ -95,7 +101,21 @@ class AutonomyRuntime:
             enter_voi_threshold=s.kalshi_enter_voi_threshold,
             require_strong_enter=bool(s.kalshi_require_strong_enter),
             min_edge=float(s.kalshi_min_edge),
+            xai_enabled=bool(s.xai_enabled),
+            max_calls_per_hour=int(s.xai_max_calls_per_hour),
         )
+        self._paper = PaperShadowBook.load(
+            s.paper_state_path,
+            start_cents=int(s.paper_start_cents),
+            target_cents=int(s.paper_target_cents),
+        )
+        # Paper-first lock: never auto-live without unlock
+        if s.kalshi_trading_mode == "live" and not s.live_unlock:
+            s.kalshi_trading_mode = "paper"  # type: ignore[assignment]
+            self.state.terminal(
+                "LIVE LOCKED — paper shadow vs live marks until LIVE_UNLOCK + $100 gate"
+            )
+            self.state.failsafes.kill(actor="paper_first_lock", reason="live_unlock_required")
         if s.kalshi_key_id:
             try:
                 pem = s.private_key_bytes()
@@ -114,8 +134,10 @@ class AutonomyRuntime:
                 self.state.terminal("WARN Kalshi client init failed — paper sim only")
 
         self.state.portfolio_source = "paper" if s.kalshi_trading_mode == "paper" else "live"
+        paper_eq = self._paper.equity_cents() if self._paper else 0
         self.state.terminal(
-            f"BOOT book={self.state.active_book_key} mode={s.kalshi_trading_mode} env={s.kalshi_env}"
+            f"BOOT book={self.state.active_book_key} mode={s.kalshi_trading_mode} env={s.kalshi_env} "
+            f"xai={s.xai_enabled} paper=${paper_eq/100:.2f} unlock={s.live_unlock}"
         )
         self._tasks = [
             asyncio.create_task(self._ingest_loop(), name="ingest"),
@@ -215,8 +237,27 @@ class AutonomyRuntime:
 
                 self.state.intel_snippets = snippets[-100:]
                 query = self._pick_query(snippets)
-                wheel = await self._wheel.build(query, snippets)
-                self.state.wheel_nodes = [n.model_dump() for n in wheel.nodes]
+                import time as _t
+
+                now = _t.time()
+                wheel_interval = float(self.state.settings.xai_wheel_min_interval_sec)
+                if (
+                    self.state.settings.xai_enabled
+                    and (now - self._last_wheel_ts) >= wheel_interval
+                ):
+                    wheel = await self._wheel.build(query, snippets)
+                    self.state.wheel_nodes = [n.model_dump() for n in wheel.nodes]
+                    self._last_wheel_ts = now
+                elif not self.state.wheel_nodes:
+                    self.state.wheel_nodes = [
+                        {
+                            "label": "macro",
+                            "domain": "economics",
+                            "confidence": 0.4,
+                            "direction": "flat",
+                            "kalshi_keywords": ["fed", "rates", "inflation"],
+                        }
+                    ]
                 self.state.last_ingest_ts = _iso()
                 await self.state.publish({"type": "wheel", "nodes": self.state.wheel_nodes})
                 await self.state.publish(
@@ -564,10 +605,9 @@ class AutonomyRuntime:
 
         shards = dict(self.state.book().live_shard_balances_cents or {})
         funded = funded_exchange_indexes(shards, min_cents=1)
-        # Live books with known breakdown: only evaluate markets we can fund.
-        # If breakdown missing (paper / first sync), do not filter yet.
+        # Live only: filter to funded shards. Paper shadow can trade any open market.
         funded_filter: set[int] | None = funded if (
-            s.kalshi_trading_mode == "live" and shards
+            s.kalshi_trading_mode == "live" and s.live_unlock and shards
         ) else None
         if funded_filter is not None:
             self.state.terminal(
@@ -580,25 +620,48 @@ class AutonomyRuntime:
                 await self.state.publish({"type": "edges", "edges": [], "scanned_at": _iso()})
                 return
 
-        # Slightly wider spread tolerance for fast 15m books
-        scan_spread = float(s.kalshi_max_spread)
-        if s.kalshi_prefer_15m:
-            scan_spread = max(scan_spread, 0.12)
+        scan_spread = max(float(s.kalshi_max_spread), 0.10)
         candidates = collect_candidate_markets(
             markets,
             series_by,
             self.state.market_filter,
             max_spread=scan_spread,
             min_liquidity=s.kalshi_min_liquidity,
-            limit=max(6, int(s.kalshi_eval_batch_size) * 2),
+            limit=max(12, int(s.kalshi_eval_batch_size) * 4),
             funded_shards=funded_filter,
             prefer_micro=bool(s.kalshi_prefer_15m),
         )
-        shard_note = (
-            f" on shards {sorted(funded_filter)}" if funded_filter is not None else ""
+        # Optional cheap intel for top series (cached; provider=none → skip)
+        if s.intel_provider and s.intel_provider != "none":
+            for cand in candidates[:6]:
+                series = str(cand.get("series_ticker") or "")
+                if not series or series in self._intel_by_series:
+                    continue
+                brief = fetch_intel_brief(
+                    title=str(cand.get("title") or series),
+                    series=series,
+                    provider=s.intel_provider,
+                    api_key=s.intel_api_key,
+                    gemini_api_key=s.gemini_api_key,
+                    gemini_model=s.gemini_model,
+                )
+                if brief:
+                    self._intel_by_series[series] = {
+                        "bias": brief.bias,
+                        "confidence": brief.confidence,
+                        "bullets": brief.bullets,
+                        "provider": brief.provider,
+                    }
+
+        ranked = rank_candidates(
+            candidates,
+            min_net_edge=float(s.kalshi_min_net_edge),
+            intel_by_series=self._intel_by_series,
+            limit=max(1, int(s.kalshi_max_trades_per_cycle)),
         )
         self.state.terminal(
-            f"SCAN {len(markets)} open → {len(candidates)} fundamental candidates{shard_note}"
+            f"SCAN {len(markets)} open → {len(candidates)} cands → {len(ranked)} ranked "
+            f"(min_net_edge={s.kalshi_min_net_edge})"
         )
         if not candidates:
             self.state.edges = []
@@ -607,125 +670,77 @@ class AutonomyRuntime:
             await self.state.publish({"type": "terminal", "terminal": list(self.state.terminal_lines)[-80:]})
             return
 
-        # Group siblings by event for multi-outcome context
-        by_event: dict[str, list[dict[str, Any]]] = {}
-        for c in candidates:
-            et = str(c.get("event_ticker") or c.get("ticker"))
-            by_event.setdefault(et, []).append(c)
-
         evaluations: list[dict[str, Any]] = []
         enter_edges: list[dict[str, Any]] = []
-        batch = candidates[: int(s.kalshi_eval_batch_size)]
-        now = time.time()
-        for cand in batch:
-            ticker = str(cand.get("ticker") or "")
-            last = self._recent_evals.get(ticker)
-            # 15m books move fast — re-eval sooner than monthly
-            cooldown = 45 if cand.get("micro_horizon") else 180
-            if last is not None and (now - last) < cooldown:
-                continue
-            siblings = by_event.get(str(cand.get("event_ticker") or ticker), [cand])
+        # Paper: one position max — skip new ENTERs if already open
+        if self._paper and self._paper.positions and s.kalshi_trading_mode == "paper":
             self.state.terminal(
-                f"EVAL {ticker} mkt={float(cand['market_prob'])*100:.1f}% · {cand.get('title') or ''}"[:140]
+                f"PAPER hold — {len(self._paper.positions)} open; manage only "
+                f"eq=${self._paper.equity_cents()/100:.2f}"
             )
-            await self.state.publish({"type": "terminal", "line": list(self.state.terminal_lines)[-1]})
-            verdict = await self._evaluator.evaluate(
-                cand,
-                siblings=siblings,
-                intel_snippets=self.state.intel_snippets,
-                wheel_nodes=self.state.wheel_nodes,
+            ranked = []
+
+        for row in ranked:
+            ticker = str(row.get("ticker") or "")
+            series = str(row.get("series_ticker") or "")
+            if self._paper and not self._paper.can_enter_series(series):
+                self.state.terminal(f"SKIP {ticker} — series cooldown after stop")
+                continue
+            self.state.terminal(
+                f"RANK {ticker} {str(row.get('side')).upper()} net={float(row['net_edge']):+.2%} "
+                f"score={row['score']} · {row.get('title') or ''}"[:160]
             )
-            self._recent_evals[ticker] = time.time()
-            row = verdict.model_dump()
-            evaluations.append(row)
-            # Stream into dashboard immediately (don't wait for full batch)
-            self.state.evaluations = (evaluations + [
-                e for e in self.state.evaluations if e.get("ticker") not in {x.get("ticker") for x in evaluations}
-            ])[:80]
-            allow_enter = verdict.verdict == "ENTER" and (
-                verdict.strength == "strong" or not s.kalshi_require_strong_enter
-            )
-            if allow_enter:
-                self.state.terminal(
-                    f"ENTER {ticker} {verdict.side.upper()} VOI={verdict.value_of_interest:.2f} "
-                    f"edge={verdict.edge:+.2%} str={verdict.strength} :: {verdict.reason}"[:180]
-                )
-                edge_row = EdgeCandidate(
-                    ticker=verdict.ticker,
-                    event_ticker=cand.get("event_ticker"),
-                    category=verdict.category,
-                    title=verdict.title,
-                    model_prob=verdict.model_prob if verdict.side == "yes" else 1.0 - verdict.model_prob,
-                    market_prob=verdict.market_prob,
-                    edge=abs(verdict.edge),
-                    side=verdict.side,
-                    liquidity=cand.get("liquidity"),
-                    action="buy_yes" if verdict.side == "yes" else "buy_no",
-                ).model_dump()
-                if cand.get("exchange_index") is not None:
-                    edge_row["exchange_index"] = cand.get("exchange_index")
-                if cand.get("close_time"):
-                    edge_row["close_time"] = cand.get("close_time")
-                edge_row["micro_horizon"] = bool(cand.get("micro_horizon"))
-                enter_edges.append(edge_row)
-                self.state.edges = list(enter_edges)
-            else:
-                self.state.terminal(
-                    f"SKIP {ticker} VOI={verdict.value_of_interest:.2f} "
-                    f"strength={verdict.strength} :: {verdict.reason}"[:180]
-                )
-            await self.state.publish({"type": "terminal", "line": list(self.state.terminal_lines)[-1]})
-            await self.state.publish(
-                {
-                    "type": "edges",
-                    "edges": self.state.edges,
-                    "evaluations": self.state.evaluations[:40],
-                    "scanned_at": _iso(),
-                }
+            evaluations.append({**row, "verdict": "ENTER"})
+            edge_row = EdgeCandidate(
+                ticker=ticker,
+                event_ticker=row.get("event_ticker"),
+                category=row.get("category"),
+                title=row.get("title"),
+                model_prob=float(row.get("fair") or 0.5),
+                market_prob=float(row.get("market_prob") or 0.5),
+                edge=abs(float(row.get("net_edge") or 0)),
+                side=row.get("side") or "yes",  # type: ignore[arg-type]
+                liquidity=row.get("liquidity"),
+                action="buy_yes" if row.get("side") == "yes" else "buy_no",
+            ).model_dump()
+            if row.get("exchange_index") is not None:
+                edge_row["exchange_index"] = row.get("exchange_index")
+            edge_row["micro_horizon"] = bool(row.get("micro_horizon"))
+            edge_row["close_time"] = row.get("close_time")
+            # Attach live book for paper fills
+            raw = next((c.get("raw") for c in candidates if c.get("ticker") == ticker), {}) or {}
+            edge_row["yes_bid"] = raw.get("yes_bid_dollars")
+            edge_row["yes_ask"] = raw.get("yes_ask_dollars")
+            enter_edges.append(edge_row)
+            self.state.terminal(
+                f"ENTER {ticker} {edge_row['side'].upper()} net={float(row['net_edge']):+.2%} "
+                f":: ranker score={row['score']}"[:180]
             )
 
-        # Secondary heuristic edges: optional / never for production unless explicitly enabled
-        allow_secondary = bool(s.kalshi_allow_secondary_edges) and s.kalshi_env != "production"
-        if not enter_edges and allow_secondary and self.state.wheel_nodes:
-            from backend.app.workers.futures_wheel import WheelNode
-
-            nodes = []
-            for raw in self.state.wheel_nodes:
-                try:
-                    nodes.append(WheelNode.model_validate(raw))
-                except Exception:
-                    continue
-            if nodes:
-                secondary = score_edges(
-                    nodes,
-                    markets,
-                    series_by,
-                    self.state.market_filter,
-                    min_edge=s.kalshi_min_edge,
-                    max_spread=s.kalshi_max_spread,
-                    min_liquidity=s.kalshi_min_liquidity,
-                )
-                for e in secondary[:5]:
-                    enter_edges.append(e.model_dump())
-                if secondary:
-                    self.state.terminal(f"SECONDARY wheel-match edges={len(secondary)} (non-prod only)")
-        elif not enter_edges:
-            self.state.terminal("NO ENTER this scan — waiting for next odds/xAI signal")
+        if not enter_edges:
+            self.state.terminal("NO ENTER this scan — waiting for next ranker signal")
 
         self.state.evaluations = (evaluations + self.state.evaluations)[:80]
         self.state.edges = enter_edges
+        paper_note = ""
+        if self._paper:
+            paper_note = f" paper=${self._paper.equity_cents()/100:.2f}"
         self.state.terminal(
-            f"SCAN done evals={len(evaluations)} enter={len(enter_edges)} book={self.state.active_book_key}"
+            f"SCAN done ranked={len(evaluations)} enter={len(enter_edges)} "
+            f"book={self.state.active_book_key}{paper_note}"
         )
         await self.state.publish(
             {
                 "type": "edges",
                 "edges": self.state.edges,
                 "evaluations": evaluations,
+                "paper": self._paper.snapshot() if self._paper else None,
                 "scanned_at": _iso(),
             }
         )
         await self.state.publish({"type": "terminal", "terminal": list(self.state.terminal_lines)[-120:]})
+        if self._paper:
+            self._paper.save(self.state.settings.paper_state_path)
 
     async def _trade_loop(self) -> None:
         """Auto-place trades from top Futures-Wheel-ranked Kalshi opportunities."""
@@ -814,7 +829,9 @@ class AutonomyRuntime:
             exchange_index = None
 
         shards = dict(self.state.book().live_shard_balances_cents or {})
-        if s.kalshi_trading_mode == "live" and shards:
+        if s.kalshi_trading_mode == "paper" and self._paper is not None:
+            cash = max(0, self._paper.cash_cents)
+        elif s.kalshi_trading_mode == "live" and shards:
             if exchange_index is None:
                 self.state.terminal(f"SKIP {ticker} — missing exchange_index (cannot route shard)")
                 return False
@@ -886,11 +903,16 @@ class AutonomyRuntime:
 
         import time
 
+        # Live auto-orders require explicit unlock after paper $10→$100 gate
+        if s.kalshi_trading_mode == "live" and not s.live_unlock:
+            self.state.terminal(f"BLOCKED live order {ticker} — LIVE_UNLOCK=false (paper gate)")
+            return False
+
         if s.kalshi_trading_mode == "paper" or not self._kalshi:
-            await self._paper_fill(intent, edge)
+            ok = await self._paper_shadow_fill(intent, edge)
             self._recent_trades[ticker] = time.time()
             await self.state.publish({"type": "ledger"})
-            return True
+            return ok
 
         try:
             # Ensure UUID-shaped client_order_id for Kalshi V2
@@ -972,38 +994,70 @@ class AutonomyRuntime:
             await self.state.publish({"type": "ledger"})
             return False
 
-    async def _paper_fill(self, intent: OrderIntent, edge: dict[str, Any]) -> None:
-        price = intent.yes_price or 50
-        cost = price * intent.count
-        self.state.paper_cash_cents -= cost
-        pos = self.state.paper_positions.get(intent.ticker) or {
-            "ticker": intent.ticker,
-            "qty": 0,
-            "avg_price_cents": 0,
+    async def _paper_shadow_fill(self, intent: OrderIntent, edge: dict[str, Any]) -> bool:
+        """Fill virtual book at live bid/ask (conservative)."""
+        assert self._paper is not None
+        yes_bid = edge.get("yes_bid")
+        yes_ask = edge.get("yes_ask")
+        try:
+            yb = float(yes_bid) if yes_bid is not None else None
+            ya = float(yes_ask) if yes_ask is not None else None
+        except (TypeError, ValueError):
+            yb, ya = None, None
+        if yb is None or ya is None:
+            # Fetch live book
+            mark = await self._fetch_mark_yes(intent.ticker)
+            if mark is None:
+                self.state.terminal(f"PAPER SKIP {intent.ticker} — no live mark")
+                return False
+            yb = max(0.01, mark - 0.02)
+            ya = min(0.99, mark + 0.02)
+        # Size from paper cash
+        pay = int(intent.yes_price or 50) if intent.side == "yes" else max(1, 100 - int(intent.yes_price or 50))
+        qty = max(1, min(intent.count, self._paper.cash_cents // max(1, pay)))
+        fill = self._paper.open_position(
+            ticker=intent.ticker,
+            side=intent.side,
+            qty=qty,
+            yes_bid=yb,
+            yes_ask=ya,
+            exchange_index=edge.get("exchange_index"),
+        )
+        if not fill:
+            self.state.terminal(f"PAPER SKIP {intent.ticker} — insufficient virtual cash")
+            return False
+        self._entry_marks[intent.ticker] = {
             "side": intent.side,
+            "entry_yes_prob": float(ya if intent.side == "yes" else yb),
+            "exchange_index": edge.get("exchange_index"),
+            "opened_ts": fill.ts,
+            "count": fill.qty,
         }
-        pos["qty"] = int(pos["qty"]) + intent.count
-        pos["avg_price_cents"] = price
-        pos["side"] = intent.side
-        self.state.paper_positions[intent.ticker] = pos
-        self.state.portfolio_source = "paper"
-        self.state.positions = list(self.state.paper_positions.values())
-        self.state.portfolio_updated_ts = _iso()
-        equity = self._paper_equity_cents()
-        self.state.pnl.record(equity, realized_pnl_cents=self.state.pnl.daily_pnl_cents())
-        self.state.failsafes.update_equity(equity)
         self.state.ledger.append(
             kind="fill",
             ticker=intent.ticker,
             side=intent.side,
-            qty=intent.count,
-            price_cents=price,
+            qty=fill.qty,
+            price_cents=fill.price_cents,
             mode="paper",
             status="filled",
-            message=f"Paper fill edge={edge.get('edge')} (wheel-driven)",
-            meta=intent.model_dump(),
+            message=(
+                f"PAPER open vs live book eq=${self._paper.equity_cents()/100:.2f} "
+                f"target=${self._paper.target_cents/100:.2f}"
+            ),
+            meta={"paper": self._paper.snapshot(), "edge": edge.get("edge")},
         )
-        await self.state.publish({"type": "portfolio", "portfolio_source": "paper", "positions": self.state.positions})
+        self.state.terminal(
+            f"PAPER OPEN {intent.ticker} {intent.side.upper()} x{fill.qty} @ {fill.price_cents}¢ "
+            f"eq=${self._paper.equity_cents()/100:.2f}"
+        )
+        self._paper.save(self.state.settings.paper_state_path)
+        await self.state.publish({"type": "paper", "paper": self._paper.snapshot()})
+        return True
+
+    async def _paper_fill(self, intent: OrderIntent, edge: dict[str, Any]) -> None:
+        # Legacy compat — route to shadow book
+        await self._paper_shadow_fill(intent, edge)
 
     async def sync_live_portfolio(self) -> dict[str, Any]:
         """Pull authoritative cash/positions from Kalshi when live (or on demand)."""
@@ -1106,6 +1160,15 @@ class AutonomyRuntime:
             mode = trading_mode.strip().lower()
             if mode not in {"paper", "live"}:
                 return {"ok": False, "error": "trading_mode must be paper|live"}
+            if mode == "live" and not s.live_unlock:
+                return {
+                    "ok": False,
+                    "error": (
+                        "LIVE locked until paper shadow reaches $100 gate "
+                        "and LIVE_UNLOCK=true is set."
+                    ),
+                    "paper": self._paper.snapshot() if self._paper else None,
+                }
             s.kalshi_trading_mode = mode  # type: ignore[assignment]
 
         if kalshi_env is not None:
@@ -1208,12 +1271,16 @@ class AutonomyRuntime:
         }
 
     async def _position_manage_loop(self) -> None:
-        """Watch open positions; stop-loss / take-profit / flip / time-stop."""
+        """Watch open positions; stop-loss / take-profit / time-stop (no LLM)."""
         while not self._stop.is_set():
             try:
-                if (
-                    self.state.failsafes.can_place_orders()
-                    and self.state.settings.kalshi_trading_mode == "live"
+                if not self.state.failsafes.can_place_orders() and self.state.settings.kalshi_trading_mode == "live":
+                    pass
+                elif self.state.settings.kalshi_trading_mode == "paper" and self._paper and self._paper.positions:
+                    await self._manage_paper_positions()
+                elif (
+                    self.state.settings.kalshi_trading_mode == "live"
+                    and self.state.settings.live_unlock
                     and self.state.positions
                 ):
                     await self._manage_open_positions()
@@ -1227,10 +1294,89 @@ class AutonomyRuntime:
             except asyncio.TimeoutError:
                 pass
 
+    async def _manage_paper_positions(self) -> None:
+        assert self._paper is not None
+        s = self.state.settings
+        for ticker, pos in list(self._paper.positions.items()):
+            mark_yes = await self._fetch_mark_yes(ticker)
+            if mark_yes is None:
+                continue
+            self._paper.update_mark(ticker, mark_yes)
+            # Need bid/ask for conservative exit
+            yes_bid, yes_ask = await self._fetch_bid_ask(ticker)
+            if yes_bid is None or yes_ask is None:
+                yes_bid = max(0.01, mark_yes - 0.02)
+                yes_ask = min(0.99, mark_yes + 0.02)
+            flip_side = None  # anti-churn: flips off in paper phase unless enabled
+            if s.kalshi_allow_flip:
+                flip_side = "no" if pos.side == "yes" else "yes"
+            sec_left = await self._seconds_to_close(ticker)
+            decision = decide_position_action(
+                side=pos.side,
+                entry_yes_prob=pos.entry_yes_prob,
+                mark_yes_prob=mark_yes,
+                stop_loss_prob=float(s.kalshi_stop_loss_prob),
+                take_profit_prob=float(s.kalshi_take_profit_prob),
+                flip_side=flip_side if s.kalshi_allow_flip else None,
+                flip_min_edge=float(s.kalshi_flip_min_edge),
+                seconds_to_close=sec_left,
+                time_stop_sec=float(s.kalshi_time_stop_sec),
+            )
+            if decision.action == "hold":
+                continue
+            # Map flip → stop_loss for paper (no churn re-entry)
+            status = decision.action if decision.action != "flip" else "stop_loss"
+            fill = self._paper.close_position(
+                ticker=ticker,
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+                status=status,
+                reason=decision.reason,
+            )
+            if not fill:
+                continue
+            self._entry_marks.pop(ticker, None)
+            self.state.ledger.append(
+                kind="fill",
+                ticker=ticker,
+                side=pos.side,
+                qty=pos.qty,
+                price_cents=fill.price_cents,
+                mode="paper",
+                status=status,
+                message=(
+                    f"PAPER {status} pnl={fill.pnl_cents}¢ eq=${self._paper.equity_cents()/100:.2f} "
+                    f"::{decision.reason}"
+                )[:220],
+                meta={"paper": self._paper.snapshot()},
+            )
+            self.state.terminal(
+                f"PAPER {status.upper()} {ticker} pnl={fill.pnl_cents}¢ "
+                f"eq=${self._paper.equity_cents()/100:.2f} W/L={self._paper.wins}/{self._paper.losses}"
+            )
+            self._paper.save(s.paper_state_path)
+            await self.state.publish({"type": "paper", "paper": self._paper.snapshot()})
+            await self.state.publish({"type": "ledger"})
+
+    async def _fetch_bid_ask(self, ticker: str) -> tuple[float | None, float | None]:
+        if not self._kalshi:
+            return None, None
+        try:
+            resp = await self._kalshi.list_markets(tickers=ticker, limit=1)
+            markets = resp.get("markets") or []
+            if not markets:
+                return None, None
+            m = markets[0]
+            return float(m.get("yes_bid_dollars") or 0) or None, float(m.get("yes_ask_dollars") or 0) or None
+        except Exception:
+            return None, None
+
     async def _manage_open_positions(self) -> None:
+        """Live position manager — only when LIVE_UNLOCK is on. No LLM re-eval."""
         assert self._kalshi
         s = self.state.settings
-        # Refresh marks
+        if not s.live_unlock:
+            return
         await self.sync_live_portfolio()
         for pos in list(self.state.positions):
             ticker = str(pos.get("ticker") or "")
@@ -1243,7 +1389,6 @@ class AutonomyRuntime:
             entry = self._entry_marks.get(ticker) or {}
             entry_yes = float(entry.get("entry_yes_prob") or 0)
             if entry_yes <= 0:
-                # Reconstruct from avg_price_cents if we missed the mark
                 avg = int(pos.get("avg_price_cents") or 0)
                 entry_yes = (avg / 100.0) if side == "yes" else max(0.01, 1.0 - avg / 100.0)
 
@@ -1251,30 +1396,7 @@ class AutonomyRuntime:
             if mark_yes is None:
                 continue
 
-            # Optional re-eval for flip signal (odds heuristic — fast, no LLM required)
             flip_side = None
-            if self._evaluator:
-                try:
-                    verdict = await self._evaluator.evaluate(
-                        {
-                            "ticker": ticker,
-                            "market_prob": mark_yes,
-                            "spread": 0.04,
-                            "category": pos.get("category") or "Crypto",
-                            "title": ticker,
-                            "micro_horizon": "15M" in ticker.upper(),
-                            "series_ticker": ticker.rsplit("-", 1)[0] if "-" in ticker else ticker,
-                        },
-                        siblings=[],
-                        intel_snippets=self.state.intel_snippets,
-                        wheel_nodes=self.state.wheel_nodes,
-                        position={"side": side, "qty": qty, "entry_yes": entry_yes},
-                    )
-                    if verdict.verdict == "ENTER" and verdict.side != side:
-                        flip_side = verdict.side
-                except Exception:
-                    logger.exception("re-eval for %s failed", ticker)
-
             sec_left = await self._seconds_to_close(ticker)
             decision = decide_position_action(
                 side=side,
@@ -1294,32 +1416,15 @@ class AutonomyRuntime:
                 f"{decision.action.upper()} {ticker} {side} mark={mark_yes:.2f} "
                 f"entry={entry_yes:.2f} pnl={decision.pnl_prob:+.3f} :: {decision.reason}"[:180]
             )
-            closed = await self._live_close_position(
+            await self._live_close_position(
                 ticker=ticker,
                 side=side,
                 qty=qty,
                 mark_yes=mark_yes,
                 exchange_index=entry.get("exchange_index") or pos.get("exchange_index"),
-                status=decision.action,
+                status=decision.action if decision.action != "flip" else "stop_loss",
                 reason=decision.reason,
             )
-            if closed and decision.action == "flip" and decision.flip_to:
-                # Immediately enter opposite side (bypass cooldown from the close)
-                self._recent_trades.pop(ticker, None)
-                await self.sync_live_portfolio()
-                await self._maybe_trade(
-                    {
-                        "ticker": ticker,
-                        "side": decision.flip_to,
-                        "market_prob": mark_yes,
-                        "action": "buy_yes" if decision.flip_to == "yes" else "buy_no",
-                        "category": "Crypto",
-                        "title": ticker,
-                        "exchange_index": entry.get("exchange_index") or pos.get("exchange_index"),
-                        "edge": abs(decision.pnl_prob),
-                        "micro_horizon": True,
-                    }
-                )
 
     async def _fetch_mark_yes(self, ticker: str) -> float | None:
         if not self._kalshi:

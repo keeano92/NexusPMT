@@ -203,6 +203,8 @@ class AppState:
             "live_realized_pnl_cents": book.live_realized_pnl_cents,
             "live_shard_balances_cents": dict(book.live_shard_balances_cents or {}),
             "portfolio_updated_ts": book.portfolio_updated_ts,
+            "live_unlock": bool(getattr(self.settings, "live_unlock", False)),
+            "xai_enabled": bool(getattr(self.settings, "xai_enabled", False)),
             "trading_halted": self.failsafes.snapshot()["state"] == "killed",
             "trading_halt_reason": next(
                 (

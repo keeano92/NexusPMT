@@ -21,6 +21,8 @@ def live_state():
         WORLDMAP_REQUIRED=False,
         KALSHI_TRADING_MODE="live",
         KALSHI_ENV="production",
+        LIVE_UNLOCK=True,
+        XAI_ENABLED=False,
         KALSHI_REQUIRE_APPROVAL_ABOVE_CENTS=10_000_000,
         KALSHI_STRONG_ALLOCATION_PCT=0.9,
         RISK_AUTO_KILL_ON_ERRORS=3,
