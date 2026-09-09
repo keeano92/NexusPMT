@@ -1,0 +1,38 @@
+# NexusPMT + shared network with SK AI WorldMap
+name: nexuspmt
+
+services:
+  nexus-pmt:
+    build: .
+    image: nexus-pmt:latest
+    container_name: nexus-pmt
+    env_file:
+      - .env
+    environment:
+      WORLDMAP_BASE_URL: http://sk-ai-worldmap:8080
+      WORLDMAP_HEALTH_PATH: /api/sidecar-health
+      KALSHI_PRIVATE_KEY_PATH: /run/secrets/kalshi_private.pem
+      NEXUSPMT_HOST: 0.0.0.0
+      NEXUSPMT_PORT: "8080"
+    ports:
+      - "${NEXUSPMT_PUBLISH_PORT:-8088}:8080"
+    volumes:
+      - ./secrets/kalshi_private.pem:/run/secrets/kalshi_private.pem:ro
+    networks:
+      - somykida_net
+    restart: unless-stopped
+
+  # Optional: attach a pre-built WorldMap image onto the shared net.
+  # Prefer running WorldMap from its own compose + override; this is a helper.
+  sk-ai-worldmap:
+    image: sk-ai-worldmap:latest
+    container_name: sk-ai-worldmap
+    profiles: ["bundled-worldmap"]
+    networks:
+      - somykida_net
+    # WorldMap expects its redis/relay/env — use WorldMap's own compose for real runs.
+
+networks:
+  somykida_net:
+    name: somykida_net
+    driver: bridge

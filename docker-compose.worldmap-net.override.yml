@@ -1,0 +1,16 @@
+# Drop this beside the WorldMap repo compose (or merge via):
+#   docker compose -f docker-compose.yml -f ../NexusPMT/docker-compose.worldmap-net.override.yml up -d
+#
+# Joins the WorldMap `app` service to somykida_net so NexusPMT can reach
+# http://sk-ai-worldmap:8080 on the shared bridge.
+
+services:
+  app:
+    networks:
+      - default
+      - somykida_net
+
+networks:
+  somykida_net:
+    external: true
+    name: somykida_net

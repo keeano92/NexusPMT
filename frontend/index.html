@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NexusPMT — Operator Desk</title>
+  <link rel="stylesheet" href="/static/styles/bttf.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="scanlines" aria-hidden="true"></div>
+  <header class="topbar">
+    <div class="brand">
+      <span class="flux">NEXUS</span><span class="amber">PMT</span>
+      <span class="tag">FUNDAMENTALS ONLY</span>
+    </div>
+    <div class="status-pills" id="statusPills">
+      <span class="pill" id="pillMode">PAPER</span>
+      <span class="pill" id="pillEnv">DEMO</span>
+      <span class="pill" id="pillFs">RUNNING</span>
+      <span class="pill" id="pillWm">WM …</span>
+    </div>
+    <div class="token-box">
+      <label for="opToken">OP TOKEN</label>
+      <input id="opToken" type="password" placeholder="operator token" autocomplete="off" />
+    </div>
+  </header>
+
+  <section class="controls deck">
+    <h2>FAIL-SAFE CONTROL DECK</h2>
+    <div class="control-grid">
+      <button class="btn kill" id="btnKill" type="button">KILL SWITCH</button>
+      <button class="btn warn" id="btnPause" type="button">PAUSE</button>
+      <button class="btn ok" id="btnResume" type="button">RESUME</button>
+      <button class="btn warn" id="btnClearKill" type="button">CLEAR KILL</button>
+      <button class="btn danger" id="btnFlatten" type="button">FLATTEN ALL</button>
+    </div>
+    <p class="hint">Autonomy runs until you pause/kill. Flatten requires typing FLATTEN.</p>
+  </section>
+
+  <section class="pnl deck">
+    <div class="pnl-head">
+      <h2>PnL COMMAND</h2>
+      <div class="daily" id="dailyPnl">$0.00</div>
+    </div>
+    <div class="horizon-tabs" id="horizonTabs">
+      <button data-h="rt" class="active">RT</button>
+      <button data-h="5m">5m</button>
+      <button data-h="15m">15m</button>
+      <button data-h="30m">30m</button>
+      <button data-h="1h">1h</button>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="pnlChart" height="120"></canvas>
+    </div>
+    <div class="horizon-stats" id="horizonStats"></div>
+  </section>
+
+  <main class="grid">
+    <section class="deck">
+      <h2>FUTURES WHEEL</h2>
+      <div id="wheelStream" class="stream"></div>
+    </section>
+    <section class="deck">
+      <h2>MARKET EDGE</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Ticker</th><th>Cat</th><th>Mkt</th><th>Model</th><th>Edge</th><th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="edgeBody"></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="deck wide">
+      <h2>TRADE LEDGER</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th><th>Kind</th><th>Ticker</th><th>Side</th><th>Qty</th><th>Px</th><th>Mode</th><th>Status</th><th>Msg</th>
+            </tr>
+          </thead>
+          <tbody id="ledgerBody"></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="deck">
+      <h2>PORTFOLIO</h2>
+      <div id="portfolio" class="stream"></div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>WorldMap ingest <span id="lastIngest">—</span></span>
+    <span>Sports filter STRICT · No entertainment odds</span>
+  </footer>
+</body>
+</html>
