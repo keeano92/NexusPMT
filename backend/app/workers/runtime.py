@@ -710,7 +710,7 @@ class AutonomyRuntime:
                 if secondary:
                     self.state.terminal(f"SECONDARY wheel-match edges={len(secondary)} (non-prod only)")
         elif not enter_edges:
-            self.state.terminal("NO ENTER — waiting for strong xAI+wheel verdicts (secondary disabled)")
+            self.state.terminal("NO ENTER this scan — waiting for next odds/xAI signal")
 
         self.state.evaluations = (evaluations + self.state.evaluations)[:80]
         self.state.edges = enter_edges
