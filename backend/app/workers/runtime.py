@@ -268,7 +268,7 @@ class AutonomyRuntime:
                     }
                 )
 
-                await self._refresh_edges(wheel.nodes)
+                await self._refresh_edges(self.state.wheel_nodes)
                 self.state.failsafes.record_api_success()
             except asyncio.CancelledError:
                 raise

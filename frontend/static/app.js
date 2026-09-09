@@ -63,7 +63,18 @@
     );
     if ($("selMode") && snap.trading_mode) $("selMode").value = snap.trading_mode;
     if ($("selEnv") && snap.kalshi_env) $("selEnv").value = snap.kalshi_env;
-    if ($("bookTag")) $("bookTag").textContent = snap.book_key || `${snap.kalshi_env}:${snap.trading_mode}`;
+    if ($("bookTag")) {
+      const paper = snap.paper;
+      let tag = snap.book_key || `${snap.kalshi_env}:${snap.trading_mode}`;
+      if (paper) {
+        tag += ` · PAPER $${((paper.equity_cents || 0) / 100).toFixed(2)}→$${(
+          (paper.target_cents || 10000) / 100
+        ).toFixed(0)}`;
+        if (paper.gate_ready) tag += " · GATE OK";
+      }
+      if (!snap.live_unlock) tag += " · LIVE LOCKED";
+      $("bookTag").textContent = tag;
+    }
     renderWorldmapGate(snap);
   }
 
