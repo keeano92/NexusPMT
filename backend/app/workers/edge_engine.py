@@ -119,6 +119,15 @@ def score_edges(
                 matched = node
                 break
         if matched is None:
+            # Soft category bridge: economics/politics nodes can match same-category markets
+            cat = str((series or {}).get("category") or market.get("category") or "").lower()
+            for node in nodes:
+                if node.domain in {"economics", "politics", "trade"} and any(
+                    x in cat for x in ("econom", "politic", "financ", "election")
+                ):
+                    matched = node
+                    break
+        if matched is None:
             continue
 
         model_prob = float(matched.confidence)

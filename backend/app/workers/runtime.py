@@ -79,13 +79,21 @@ class AutonomyRuntime:
         interval = self.state.settings.worldmap_poll_interval_sec
         while not self._stop.is_set():
             try:
-                code, _ = await self._wm.sidecar_health()
-                compact = {}
+                code = 0
+                compact: dict[str, Any] = {}
                 try:
-                    compact = await self._wm.health_compact()
-                except Exception:
-                    compact = {"status": "UNKNOWN", "sidecar": code}
-                self.state.worldmap_health = {"sidecar_status": code, **(compact if isinstance(compact, dict) else {})}
+                    code, _ = await self._wm.sidecar_health()
+                    try:
+                        compact = await self._wm.health_compact()
+                    except Exception:
+                        compact = {"status": "UNKNOWN", "sidecar": code}
+                except Exception as exc:
+                    logger.warning("WorldMap liveness unreachable: %s", exc)
+                    compact = {"status": "UNREACHABLE", "error": str(exc)}
+                self.state.worldmap_health = {
+                    "sidecar_status": code,
+                    **(compact if isinstance(compact, dict) else {}),
+                }
 
                 snippets: list[str] = []
                 try:
@@ -93,7 +101,9 @@ class AutonomyRuntime:
                     snippets.extend(self._snippets_from_bootstrap(boot))
                 except Exception as exc:
                     logger.warning("bootstrap failed: %s", exc)
-                    snippets.append(f"WorldMap bootstrap unavailable: {exc}")
+                    snippets.append(
+                        "WorldMap bootstrap unavailable — using local macro fallback intel"
+                    )
 
                 self.state.intel_snippets = snippets[-100:]
                 query = self._pick_query(snippets)
@@ -103,7 +113,8 @@ class AutonomyRuntime:
                 await self.state.publish({"type": "wheel", "nodes": self.state.wheel_nodes})
 
                 await self._refresh_edges(wheel.nodes)
-                self.state.failsafes.record_api_success()
+                if code == 200:
+                    self.state.failsafes.record_api_success()
             except asyncio.CancelledError:
                 raise
             except Exception:
