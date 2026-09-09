@@ -40,8 +40,12 @@ class EnvBook:
             kalshi_env=kalshi_env,
             trading_mode=trading_mode,
             paper_cash_cents=paper_start_cents,
+            portfolio_source="paper" if trading_mode == "paper" else "live",
         )
-        book.pnl.record(paper_start_cents)
+        # Paper books start at simulated cash. Live books wait for Kalshi sync
+        # so we never fake a $1000 anchor that creates phantom −$989 PnL.
+        if trading_mode == "paper":
+            book.pnl.record(paper_start_cents)
         return book
 
     def cash_cents(self) -> int:

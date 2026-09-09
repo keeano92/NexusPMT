@@ -103,9 +103,26 @@
 
   function renderDaily(snap) {
     const el = $("dailyPnl");
-    const v = snap.daily_pnl_cents || 0;
+    const v = snap.session_pnl_cents != null ? snap.session_pnl_cents : (snap.daily_pnl_cents || 0);
     el.textContent = money(v);
     el.className = "daily" + (v < 0 ? " neg" : "");
+    const line = $("pnlEquityLine");
+    if (line) {
+      const eq = snap.equity_cents != null ? money(snap.equity_cents) : money(snap.live_equity_cents || snap.cash_cents || 0);
+      const cash = money(snap.cash_cents != null ? snap.cash_cents : snap.paper_cash_cents);
+      line.textContent = `Equity ${eq} · Cash ${cash} · Source ${(snap.portfolio_source || "paper").toUpperCase()} · Book ${snap.book_key || "—"}`;
+    }
+    const halt = $("haltBanner");
+    if (halt) {
+      if (snap.trading_halted) {
+        halt.classList.remove("hidden");
+        $("haltReason").textContent = snap.trading_halt_reason
+          ? `reason: ${snap.trading_halt_reason}`
+          : "kill switch active — trades blocked";
+      } else {
+        halt.classList.add("hidden");
+      }
+    }
   }
 
   function renderEdges(edges, scannedAt, evaluations) {
@@ -268,6 +285,10 @@
   $("btnRefreshPortfolio").onclick = async () => {
     const data = await control("/api/controls/refresh-portfolio");
     if (data && data.ok === false) alert(data.error || "Portfolio refresh failed");
+  };
+  $("btnResetPnl").onclick = async () => {
+    const data = await control("/api/controls/reset-live-pnl");
+    if (data && data.ok) alert("Live PnL re-anchored at " + money(data.equity_cents) + " — trading resumed");
   };
   $("btnApplyMode").onclick = async () => {
     const trading_mode = $("selMode").value;

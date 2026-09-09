@@ -68,11 +68,18 @@
     <p class="hint">Autonomy runs until you pause/kill. Flatten requires FLATTEN. Live requires typing LIVE; production requires PRODUCTION; both require LIVE PRODUCTION.</p>
   </section>
 
+  <div id="haltBanner" class="halt-banner hidden" role="alert">
+    <strong>TRADING HALTED</strong>
+    <span id="haltReason">kill switch</span>
+    <button class="btn ok" id="btnResetPnl" type="button">RESET LIVE PnL &amp; RESUME</button>
+  </div>
+
   <section class="pnl deck">
     <div class="pnl-head">
       <h2>PnL COMMAND <span class="tag" id="bookTag">demo:paper</span></h2>
       <div class="daily" id="dailyPnl">$0.00</div>
     </div>
+    <div class="horizon-stats" id="pnlEquityLine">Equity — · Cash —</div>
     <div class="horizon-tabs" id="horizonTabs">
       <button data-h="rt" class="active">RT</button>
       <button data-h="5m">5m</button>

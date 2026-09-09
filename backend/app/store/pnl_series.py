@@ -33,10 +33,26 @@ class PnLSeriesStore:
         self._lock = Lock()
         self._marks: Deque[EquityMark] = deque(maxlen=max_points)
         self._day_anchor_cents: int | None = None
+        self._live_baseline_set: bool = False
 
     @staticmethod
     def _now() -> float:
         return datetime.now(timezone.utc).timestamp()
+
+    def reset_anchor(self, equity_cents: int, *, clear_history: bool = True) -> None:
+        """Re-base session PnL at equity (used when first live Kalshi sync arrives)."""
+        with self._lock:
+            if clear_history:
+                self._marks.clear()
+            self._day_anchor_cents = equity_cents
+            self._live_baseline_set = True
+            self._marks.append(
+                EquityMark(ts=self._now(), equity_cents=equity_cents)
+            )
+
+    def has_anchor(self) -> bool:
+        with self._lock:
+            return self._day_anchor_cents is not None
 
     def record(
         self,
@@ -45,6 +61,7 @@ class PnLSeriesStore:
         realized_pnl_cents: int = 0,
         unrealized_pnl_cents: int = 0,
         ts: float | None = None,
+        establish_anchor: bool = True,
     ) -> EquityMark:
         mark = EquityMark(
             ts=ts if ts is not None else self._now(),
@@ -53,8 +70,9 @@ class PnLSeriesStore:
             unrealized_pnl_cents=unrealized_pnl_cents,
         )
         with self._lock:
-            if self._day_anchor_cents is None:
+            if self._day_anchor_cents is None and establish_anchor:
                 self._day_anchor_cents = equity_cents
+                self._live_baseline_set = True
             self._marks.append(mark)
         return mark
 

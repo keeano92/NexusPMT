@@ -79,8 +79,16 @@ class Settings(BaseSettings):
     kalshi_opportunity_scan_sec: float = Field(default=45.0, alias="KALSHI_OPPORTUNITY_SCAN_SEC")
     kalshi_contract_count: int = Field(default=1, alias="KALSHI_CONTRACT_COUNT")
     kalshi_strong_allocation_pct: float = Field(default=0.90, alias="KALSHI_STRONG_ALLOCATION_PCT")
-    kalshi_enter_voi_threshold: float = Field(default=0.65, alias="KALSHI_ENTER_VOI_THRESHOLD")
+    kalshi_enter_voi_threshold: float = Field(default=0.45, alias="KALSHI_ENTER_VOI_THRESHOLD")
     kalshi_eval_batch_size: int = Field(default=6, alias="KALSHI_EVAL_BATCH_SIZE")
+    kalshi_filter_mode: Literal["blocklist", "allowlist"] = Field(
+        default="blocklist",
+        alias="KALSHI_FILTER_MODE",
+    )
+    kalshi_allow_secondary_edges: bool = Field(
+        default=False,
+        alias="KALSHI_ALLOW_SECONDARY_EDGES",
+    )
 
     xai_api_key: str = Field(default="", alias="XAI_API_KEY")
     xai_base_url: str = Field(default="https://api.x.ai/v1", alias="XAI_BASE_URL")

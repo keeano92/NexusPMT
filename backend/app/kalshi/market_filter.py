@@ -1,10 +1,10 @@
-"""Fundamentals-only market filter — sports and entertainment blocked."""
+"""Market filter — everything allowed except sports/entertainment."""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 SPORTS_CATEGORY_NAMES = {
     "sports",
@@ -18,7 +18,7 @@ SPORTS_KEYWORDS = re.compile(
     r"soccer|football|basketball|baseball|hockey|tennis|golf|"
     r"premier\s*league|la\s*liga|serie\s*a|bundesliga|champions\s*league|"
     r"world\s*cup|super\s*bowl|march\s*madness|playoffs?|"
-    r"touchdown|home\s*run|knockout|odds|parlay|moneyline|spread|"
+    r"touchdown|home\s*run|knockout|parlay|moneyline|"
     r"espn|fantasy\s*sports?"
     r")\b",
     re.IGNORECASE,
@@ -33,7 +33,13 @@ FUNDAMENTAL_DOMAINS = {
     "crypto_macro",
     "politics",
     "trade",
+    "science",
+    "companies",
+    "world",
+    "other",
 }
+
+FilterMode = Literal["blocklist", "allowlist"]
 
 
 def _norm(value: str | None) -> str:
@@ -48,12 +54,12 @@ def is_sports_market(
     ticker: str | None = None,
 ) -> bool:
     cat = _norm(category)
-    if cat in SPORTS_CATEGORY_NAMES or "sport" in cat:
+    if cat in SPORTS_CATEGORY_NAMES or cat.startswith("sport"):
         return True
 
     for tag in tags or []:
         t = _norm(tag)
-        if t in SPORTS_CATEGORY_NAMES or "sport" in t:
+        if t in SPORTS_CATEGORY_NAMES or t.startswith("sport"):
             return True
         if SPORTS_KEYWORDS.search(t):
             return True
@@ -69,6 +75,7 @@ class MarketFilter:
     allowlist: set[str]
     blocklist: set[str]
     strict: bool = True
+    mode: FilterMode = "blocklist"  # everything except sports by default
 
     @classmethod
     def from_settings(
@@ -77,22 +84,24 @@ class MarketFilter:
         blocklist: Iterable[str],
         *,
         strict: bool = True,
+        mode: FilterMode = "blocklist",
     ) -> MarketFilter:
         return cls(
             allowlist={_norm(x) for x in allowlist if _norm(x)},
-            blocklist={_norm(x) for x in blocklist if _norm(x)},
+            blocklist={_norm(x) for x in blocklist if _norm(x)} | set(SPORTS_CATEGORY_NAMES),
             strict=strict,
+            mode=mode,
         )
 
     def category_allowed(self, category: str | None) -> bool:
         cat = _norm(category)
         if not cat:
-            return not self.strict
-        if cat in self.blocklist or "sport" in cat:
+            # Unknown category OK in blocklist mode (still sports-keyword checked)
+            return True if self.mode == "blocklist" else (not self.strict)
+        if cat in self.blocklist or cat.startswith("sport"):
             return False
-        if self.allowlist and cat not in self.allowlist:
-            # Allow partial match e.g. "Climate and Weather" vs allowlist entry
-            if not any(a in cat or cat in a for a in self.allowlist):
+        if self.mode == "allowlist" and self.allowlist:
+            if cat not in self.allowlist and not any(a in cat or cat in a for a in self.allowlist):
                 return False
         return True
 
@@ -131,6 +140,8 @@ class MarketFilter:
         d = _norm(domain)
         if not d:
             return False
-        if d in {"sports", "entertainment", "odds"}:
+        if d in {"sports", "entertainment", "odds"} or d.startswith("sport"):
             return False
+        if self.mode == "blocklist":
+            return True
         return d in FUNDAMENTAL_DOMAINS

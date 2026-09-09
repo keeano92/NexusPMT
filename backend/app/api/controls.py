@@ -223,3 +223,38 @@ async def refresh_portfolio(
         meta=result,
     )
     return result
+
+
+@router.post("/reset-live-pnl")
+async def reset_live_pnl(
+    request: Request,
+    actor: str = Depends(require_operator),
+) -> dict:
+    """Re-anchor live PnL to current Kalshi equity and clear phantom kill."""
+    state = request.app.state.state
+    runtime = request.app.state.runtime
+    if state.settings.kalshi_trading_mode != "live":
+        return {"ok": False, "error": "Only valid in live mode"}
+    sync = await runtime.sync_live_portfolio()
+    if not sync.get("ok"):
+        return sync
+    equity = int(sync.get("equity_cents") or state.live_equity_cents or 0)
+    state.pnl.reset_anchor(equity, clear_history=True)
+    state.failsafes.reset_equity_anchors(equity)
+    state.failsafes.clear_kill(actor=actor)
+    state.failsafes.resume(actor=actor)
+    state.terminal(f"RESET live PnL baseline={equity}¢ by {actor}; kill cleared")
+    state.ledger.append(
+        kind="control",
+        status="reset_live_pnl",
+        message=f"Live PnL reset by {actor} baseline={equity}",
+        meta=sync,
+    )
+    await state.publish({"type": "failsafes", "failsafes": state.failsafes.snapshot()})
+    await state.publish({"type": "pnl", "pnl": state.pnl.all_horizons()})
+    return {
+        "ok": True,
+        "equity_cents": equity,
+        "session_pnl_cents": 0,
+        "failsafes": state.failsafes.snapshot(),
+    }

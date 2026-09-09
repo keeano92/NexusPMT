@@ -22,10 +22,11 @@ Given a Kalshi market/event (often multiple outcome contracts), WorldMap intel, 
 3) Decide ENTER or SKIP.
 Rules:
 - Fundamentals only (economics, politics, geopolitics, energy, climate, tech, crypto_macro, trade). Never sports/entertainment.
-- Be skeptical. Prefer SKIP unless edge is meaningful and thesis is coherent.
+- Be skeptical but not paralyzed. Sports/entertainment are out of scope; everything else is fair game.
+- Do NOT skip solely because a market is weather or far-dated if edge/VOI is real.
 - Reply JSON only, no markdown:
 {"verdict":"ENTER"|"SKIP","side":"yes"|"no","ticker":"...","model_prob":0.0-1.0,"confidence":0.0-1.0,"value_of_interest":0.0-1.0,"strength":"strong"|"weak","reason":"...","wheel_contribution":"..."}
-- value_of_interest is how attractive the opportunity is (0-1). ENTER only if strength=strong and value_of_interest>=0.65 and |model_prob-market_prob| suggests edge.
+- value_of_interest is attractiveness (0-1). Prefer ENTER when strength=strong, VOI clears the desk threshold, and edge is meaningful.
 """
 
 

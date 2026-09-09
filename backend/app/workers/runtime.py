@@ -38,6 +38,7 @@ class AutonomyRuntime:
         self._stop = asyncio.Event()
         self._recent_trades: dict[str, float] = {}  # ticker -> unix ts
         self._recent_evals: dict[str, float] = {}
+        self._last_block_log_ts: float = 0.0
 
     async def start(self) -> None:
         s = self.state.settings
@@ -458,8 +459,9 @@ class AutonomyRuntime:
                 }
             )
 
-        # Keep legacy wheel cross-score as secondary signal when no ENTER yet
-        if not enter_edges and self.state.wheel_nodes:
+        # Secondary heuristic edges: optional / never for production unless explicitly enabled
+        allow_secondary = bool(s.kalshi_allow_secondary_edges) and s.kalshi_env != "production"
+        if not enter_edges and allow_secondary and self.state.wheel_nodes:
             from backend.app.workers.futures_wheel import WheelNode
 
             nodes = []
@@ -481,7 +483,9 @@ class AutonomyRuntime:
                 for e in secondary[:5]:
                     enter_edges.append(e.model_dump())
                 if secondary:
-                    self.state.terminal(f"SECONDARY wheel-match edges={len(secondary)}")
+                    self.state.terminal(f"SECONDARY wheel-match edges={len(secondary)} (non-prod only)")
+        elif not enter_edges:
+            self.state.terminal("NO ENTER — waiting for strong xAI+wheel verdicts (secondary disabled)")
 
         self.state.evaluations = (evaluations + self.state.evaluations)[:80]
         self.state.edges = enter_edges
@@ -502,11 +506,22 @@ class AutonomyRuntime:
         """Auto-place trades from top Futures-Wheel-ranked Kalshi opportunities."""
         while not self._stop.is_set():
             try:
-                if (
-                    self.state.worldmap_ready
-                    and self.state.failsafes.can_place_orders()
-                    and self.state.edges
-                ):
+                import time as _time
+
+                if not self.state.failsafes.can_place_orders():
+                    if self.state.failsafes.snapshot()["state"] == "killed":
+                        now = _time.time()
+                        if now - self._last_block_log_ts > 60:
+                            self.state.terminal(
+                                "BLOCKED kill_switch — no auto trades until RESET LIVE PnL & RESUME"
+                            )
+                            self._last_block_log_ts = now
+                elif not self.state.worldmap_ready:
+                    now = _time.time()
+                    if now - self._last_block_log_ts > 60:
+                        self.state.terminal("BLOCKED WorldMap not ready")
+                        self._last_block_log_ts = now
+                elif self.state.edges:
                     max_n = max(1, int(self.state.settings.kalshi_max_trades_per_cycle))
                     open_count = len(self.state.positions)
                     room = max(0, int(self.state.settings.kalshi_max_open_positions) - open_count)
@@ -715,11 +730,23 @@ class AutonomyRuntime:
             self.state.portfolio_source = "live"
             self.state.portfolio_updated_ts = _iso()
 
-            self.state.pnl.record(
-                norms["equity_cents"],
-                realized_pnl_cents=realized,
-            )
-            self.state.failsafes.update_equity(norms["equity_cents"])
+            equity = norms["equity_cents"]
+            # First live mark becomes session baseline (PnL starts at $0, not −$989)
+            if not self.state.pnl.has_anchor() or not getattr(self.state.pnl, "_live_baseline_set", False):
+                self.state.pnl.reset_anchor(equity, clear_history=True)
+                self.state.failsafes.reset_equity_anchors(equity)
+                # Recover from phantom book-switch kill
+                snap = self.state.failsafes.snapshot()
+                if snap["state"] == "killed":
+                    self.state.failsafes.clear_kill(actor="pnl_reanchor")
+                    self.state.failsafes.resume(actor="pnl_reanchor")
+                    self.state.terminal(
+                        "RECOVERED phantom PnL kill — live baseline set; trading resumed"
+                    )
+            else:
+                self.state.pnl.record(equity, realized_pnl_cents=realized)
+                self.state.failsafes.update_equity(equity)
+
             self.state.failsafes.record_api_success()
             await self.state.publish(
                 {
@@ -727,10 +754,18 @@ class AutonomyRuntime:
                     "portfolio_source": "live",
                     "cash_cents": norms["cash_cents"],
                     "live_equity_cents": norms["equity_cents"],
+                    "session_pnl_cents": self.state.pnl.daily_pnl_cents(),
                     "positions": positions,
                 }
             )
-            return {"ok": True, **norms, "positions": len(positions), "realized_pnl_cents": realized}
+            await self.state.publish({"type": "pnl", "pnl": self.state.pnl.all_horizons()})
+            return {
+                "ok": True,
+                **norms,
+                "positions": len(positions),
+                "realized_pnl_cents": realized,
+                "session_pnl_cents": self.state.pnl.daily_pnl_cents(),
+            }
         except Exception as exc:
             logger.exception("live portfolio sync failed")
             self.state.failsafes.record_api_error()
@@ -785,6 +820,9 @@ class AutonomyRuntime:
 
         # Isolate PnL/ledger/positions — demo never bleeds into production
         book = self.state.switch_book(s.kalshi_env, s.kalshi_trading_mode)
+        # Live books: do not arm risk on fake paper equity; wait for Kalshi sync
+        if s.kalshi_trading_mode == "live":
+            self.state.failsafes.reset_equity_anchors(None)
 
         # Rebuild Kalshi client if env changed or client missing
         if s.kalshi_env != prev_env or self._kalshi is None:

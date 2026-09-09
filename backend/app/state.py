@@ -46,8 +46,12 @@ class AppState:
             self.books[key] = EnvBook.create(kalshi_env, trading_mode)
         self.active_book_key = key
         book = self.books[key]
-        # Never carry demo equity anchors into production (or vice versa)
-        self.failsafes.reset_equity_anchors(book.equity_cents())
+        # Never carry demo equity anchors into production (or vice versa).
+        # Live books wait for Kalshi sync before arming risk/PnL anchors.
+        if book.trading_mode == "live" and book.live_equity_cents is None:
+            self.failsafes.reset_equity_anchors(None)
+        else:
+            self.failsafes.reset_equity_anchors(book.equity_cents())
         self.terminal(
             f"BOOK SWITCH → {key} | cash={book.cash_cents()}¢ equity={book.equity_cents()}¢ source={book.portfolio_source}"
         )
@@ -178,6 +182,8 @@ class AppState:
             "failsafes": self.failsafes.snapshot(),
             "pnl": book.pnl.all_horizons(),
             "daily_pnl_cents": book.pnl.daily_pnl_cents(),
+            "session_pnl_cents": book.pnl.daily_pnl_cents(),
+            "equity_cents": book.equity_cents(),
             "wheel": self.wheel_nodes[-50:],
             "edges": self.edges[:50],
             "evaluations": self.evaluations[-40:],
@@ -197,6 +203,15 @@ class AppState:
             "live_equity_cents": book.live_equity_cents,
             "live_realized_pnl_cents": book.live_realized_pnl_cents,
             "portfolio_updated_ts": book.portfolio_updated_ts,
+            "trading_halted": self.failsafes.snapshot()["state"] == "killed",
+            "trading_halt_reason": next(
+                (
+                    (e.get("detail") or {}).get("reason")
+                    for e in reversed(self.failsafes.snapshot().get("audit_tail") or [])
+                    if e.get("action") == "auto_kill"
+                ),
+                None,
+            ),
         }
 
 
@@ -215,6 +230,7 @@ def build_app_state(settings: Settings | None = None) -> AppState:
             s.allowlist,
             s.blocklist,
             strict=s.kalshi_sports_filter == "strict",
+            mode=s.kalshi_filter_mode,
         ),
         books=books,
         active_book_key=key,
