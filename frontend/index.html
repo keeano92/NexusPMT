@@ -47,8 +47,24 @@
       <button class="btn ok" id="btnResume" type="button">RESUME</button>
       <button class="btn warn" id="btnClearKill" type="button">CLEAR KILL</button>
       <button class="btn danger" id="btnFlatten" type="button">FLATTEN ALL</button>
+      <button class="btn ok" id="btnRefreshWheel" type="button">REFRESH WHEEL</button>
     </div>
-    <p class="hint">Autonomy runs until you pause/kill. Flatten requires typing FLATTEN.</p>
+    <div class="mode-row">
+      <label>MODE
+        <select id="selMode">
+          <option value="paper">PAPER</option>
+          <option value="live">LIVE</option>
+        </select>
+      </label>
+      <label>KALSHI ENV
+        <select id="selEnv">
+          <option value="demo">DEMO</option>
+          <option value="production">PRODUCTION</option>
+        </select>
+      </label>
+      <button class="btn warn" id="btnApplyMode" type="button">APPLY MODE</button>
+    </div>
+    <p class="hint">Autonomy runs until you pause/kill. Flatten requires FLATTEN. Live requires typing LIVE; production requires PRODUCTION; both require LIVE PRODUCTION.</p>
   </section>
 
   <section class="pnl deck">

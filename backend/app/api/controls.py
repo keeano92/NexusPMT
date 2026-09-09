@@ -21,6 +21,12 @@ class ApprovalBody(BaseModel):
     client_order_id: str
 
 
+class TradingConfigBody(BaseModel):
+    trading_mode: str | None = None  # paper | live
+    kalshi_env: str | None = None  # demo | production
+    confirm: str = ""
+
+
 @router.get("/status")
 async def status(request: Request, _actor: str = Depends(require_operator)) -> dict:
     return request.app.state.state.failsafes.snapshot()
@@ -138,4 +144,54 @@ async def force_start_worldmap(
         meta=result,
     )
     await state.publish({"type": "worldmap", "start_result": result})
+    return result
+
+
+@router.post("/trading-config")
+async def set_trading_config(
+    body: TradingConfigBody,
+    request: Request,
+    actor: str = Depends(require_operator),
+) -> dict:
+    """Switch paper/live and demo/production with typed confirmations."""
+    mode = (body.trading_mode or "").strip().lower() or None
+    env = (body.kalshi_env or "").strip().lower() or None
+    confirm = (body.confirm or "").strip().upper()
+
+    if mode == "live" and confirm not in {"LIVE", "LIVE DEMO", "LIVE PRODUCTION"}:
+        return {
+            "ok": False,
+            "error": "Switching to LIVE requires confirm=LIVE (or LIVE DEMO / LIVE PRODUCTION).",
+        }
+    if env == "production" and confirm not in {"PRODUCTION", "LIVE PRODUCTION"}:
+        return {
+            "ok": False,
+            "error": "Switching to PRODUCTION requires confirm=PRODUCTION (or LIVE PRODUCTION).",
+        }
+    if mode == "live" and env == "production" and confirm != "LIVE PRODUCTION":
+        return {
+            "ok": False,
+            "error": "Live + production together requires confirm=LIVE PRODUCTION.",
+        }
+
+    result = await request.app.state.runtime.set_trading_config(
+        trading_mode=mode,
+        kalshi_env=env,
+        actor=actor,
+    )
+    return result
+
+
+@router.post("/refresh-wheel")
+async def refresh_wheel(
+    request: Request,
+    actor: str = Depends(require_operator),
+) -> dict:
+    result = await request.app.state.runtime.force_wheel_refresh()
+    request.app.state.state.ledger.append(
+        kind="control",
+        status="refresh_wheel",
+        message=f"Wheel refresh by {actor}: ok={result.get('ok')} nodes={result.get('nodes')}",
+        meta=result,
+    )
     return result

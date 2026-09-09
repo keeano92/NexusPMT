@@ -395,6 +395,104 @@ class AutonomyRuntime:
             except asyncio.TimeoutError:
                 pass
 
+    async def set_trading_config(
+        self,
+        *,
+        trading_mode: str | None = None,
+        kalshi_env: str | None = None,
+        actor: str = "operator",
+    ) -> dict[str, Any]:
+        """Switch paper/live and demo/production; rebuild Kalshi client when env changes."""
+        s = self.state.settings
+        prev_mode = s.kalshi_trading_mode
+        prev_env = s.kalshi_env
+
+        if trading_mode is not None:
+            mode = trading_mode.strip().lower()
+            if mode not in {"paper", "live"}:
+                return {"ok": False, "error": "trading_mode must be paper|live"}
+            s.kalshi_trading_mode = mode  # type: ignore[assignment]
+
+        if kalshi_env is not None:
+            env = kalshi_env.strip().lower()
+            if env not in {"demo", "production"}:
+                return {"ok": False, "error": "kalshi_env must be demo|production"}
+            s.kalshi_env = env  # type: ignore[assignment]
+
+        # Rebuild Kalshi client if env changed or client missing
+        if s.kalshi_env != prev_env or self._kalshi is None:
+            if self._kalshi is not None:
+                await self._kalshi.aclose()
+                self._kalshi = None
+            if s.kalshi_key_id:
+                try:
+                    pem = s.private_key_bytes()
+                    self._kalshi = KalshiClient(
+                        api_key_id=s.kalshi_key_id,
+                        private_key_pem=pem,
+                        base_url=s.kalshi_base_url,
+                    )
+                except Exception as exc:
+                    logger.exception("Kalshi client rebuild failed")
+                    self.state.ledger.append(
+                        kind="control",
+                        status="error",
+                        message=f"Kalshi client rebuild failed: {exc}",
+                    )
+                    return {
+                        "ok": False,
+                        "error": f"Kalshi client rebuild failed: {exc}",
+                        "trading_mode": s.kalshi_trading_mode,
+                        "kalshi_env": s.kalshi_env,
+                    }
+
+        self.state.ledger.append(
+            kind="control",
+            status="mode_change",
+            message=(
+                f"Trading config by {actor}: mode {prev_mode}->{s.kalshi_trading_mode}, "
+                f"env {prev_env}->{s.kalshi_env}"
+            ),
+        )
+        await self.state.publish(
+            {
+                "type": "trading_config",
+                "trading_mode": s.kalshi_trading_mode,
+                "kalshi_env": s.kalshi_env,
+            }
+        )
+        return {
+            "ok": True,
+            "trading_mode": s.kalshi_trading_mode,
+            "kalshi_env": s.kalshi_env,
+            "kalshi_base_url": s.kalshi_base_url,
+            "previous": {"trading_mode": prev_mode, "kalshi_env": prev_env},
+        }
+
+    async def force_wheel_refresh(self) -> dict[str, Any]:
+        """Operator-triggered Futures Wheel rebuild from latest intel."""
+        if not self._wheel:
+            return {"ok": False, "error": "wheel engine not started"}
+        if self.state.settings.worldmap_required and not self.state.worldmap_ready:
+            return {"ok": False, "error": "WorldMap not ready"}
+        snippets = list(self.state.intel_snippets)
+        if not snippets and self._wm:
+            snippets = await self._wm.collect_intel_snippets()
+            self.state.intel_snippets = snippets[-100:]
+        query = self._pick_query(snippets)
+        wheel = await self._wheel.build(query, snippets)
+        self.state.wheel_nodes = [n.model_dump() for n in wheel.nodes]
+        self.state.last_ingest_ts = _iso()
+        await self.state.publish({"type": "wheel", "nodes": self.state.wheel_nodes})
+        await self._refresh_edges(wheel.nodes)
+        return {
+            "ok": True,
+            "query": query,
+            "nodes": len(self.state.wheel_nodes),
+            "edges": len(self.state.edges),
+            "model": wheel.raw_model,
+        }
+
     async def flatten_all(self, actor: str = "operator") -> None:
         """Manual fail-safe: flatten paper positions (live cancel/offset best-effort)."""
         for ticker, pos in list(self.state.paper_positions.items()):

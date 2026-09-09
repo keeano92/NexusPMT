@@ -61,7 +61,26 @@
       ready ? "WM READY" : "WM DOWN",
       ready || wm === 200 || wm === "HEALTHY" ? "ok" : "bad"
     );
+    if ($("selMode") && snap.trading_mode) $("selMode").value = snap.trading_mode;
+    if ($("selEnv") && snap.kalshi_env) $("selEnv").value = snap.kalshi_env;
     renderWorldmapGate(snap);
+  }
+
+  function renderWheel(nodes) {
+    const root = $("wheelStream");
+    root.innerHTML = "";
+    const list = nodes || [];
+    if (!list.length) {
+      root.innerHTML = '<div class="item">No wheel nodes yet — click REFRESH WHEEL (needs OP TOKEN).</div>';
+      return;
+    }
+    list.slice().reverse().forEach((n) => {
+      const div = document.createElement("div");
+      div.className = "item o" + (n.order || 1);
+      div.innerHTML = `<strong>L${n.order}</strong> · ${n.domain} · ${n.title}
+        <div style="color:#8b9bb4;font-size:0.72rem">conf ${((n.confidence || 0) * 100).toFixed(0)}% · ${(n.kalshi_keywords || []).join(", ")}</div>`;
+      root.appendChild(div);
+    });
   }
 
   function renderDaily(snap) {
@@ -69,18 +88,6 @@
     const v = snap.daily_pnl_cents || 0;
     el.textContent = money(v);
     el.className = "daily" + (v < 0 ? " neg" : "");
-  }
-
-  function renderWheel(nodes) {
-    const root = $("wheelStream");
-    root.innerHTML = "";
-    (nodes || []).slice().reverse().forEach((n) => {
-      const div = document.createElement("div");
-      div.className = "item o" + (n.order || 1);
-      div.innerHTML = `<strong>L${n.order}</strong> · ${n.domain} · ${n.title}
-        <div style="color:#8b9bb4;font-size:0.72rem">conf ${(n.confidence * 100).toFixed(0)}% · ${(n.kalshi_keywords || []).join(", ")}</div>`;
-      root.appendChild(div);
-    });
   }
 
   function renderEdges(edges) {
@@ -177,12 +184,19 @@
       headers: opHeaders(),
       body: body ? JSON.stringify(body) : "{}",
     });
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
     if (!res.ok) {
-      const err = await res.text();
-      alert("Control failed: " + res.status + " " + err);
-      return;
+      alert("Control failed: " + res.status + " " + text);
+      return null;
+    }
+    if (data && data.ok === false) {
+      alert(data.error || "Control rejected");
+      return data;
     }
     await refresh();
+    return data;
   }
 
   $("btnKill").onclick = () => control("/api/controls/kill");
@@ -190,8 +204,30 @@
   $("btnResume").onclick = () => control("/api/controls/resume");
   $("btnClearKill").onclick = () => control("/api/controls/clear-kill");
   $("btnFlatten").onclick = () => {
-    const confirm = prompt('Type FLATTEN to close all positions');
-    if (confirm) control("/api/controls/flatten", { confirm });
+    const confirmTxt = prompt("Type FLATTEN to close all positions");
+    if (confirmTxt) control("/api/controls/flatten", { confirm: confirmTxt });
+  };
+  $("btnRefreshWheel").onclick = async () => {
+    const data = await control("/api/controls/refresh-wheel");
+    if (data && data.ok) alert("Wheel refreshed: " + data.nodes + " nodes (" + (data.model || "?") + ")");
+  };
+  $("btnApplyMode").onclick = async () => {
+    const trading_mode = $("selMode").value;
+    const kalshi_env = $("selEnv").value;
+    let confirmTxt = "";
+    if (trading_mode === "live" && kalshi_env === "production") {
+      confirmTxt = prompt('Type LIVE PRODUCTION to enable live trading on production Kalshi');
+    } else if (trading_mode === "live") {
+      confirmTxt = prompt("Type LIVE to enable live trading (still on selected env)");
+    } else if (kalshi_env === "production") {
+      confirmTxt = prompt("Type PRODUCTION to switch Kalshi env to production (paper still safer)");
+    }
+    if ((trading_mode === "live" || kalshi_env === "production") && !confirmTxt) return;
+    await control("/api/controls/trading-config", {
+      trading_mode,
+      kalshi_env,
+      confirm: confirmTxt || "",
+    });
   };
 
   document.querySelectorAll("#horizonTabs button").forEach((btn) => {
@@ -221,7 +257,8 @@
           $("wmBlockDetail").textContent = JSON.stringify(msg.start_result, null, 2);
           refresh();
         }
-      } else if (msg.type === "ledger" || msg.type === "failsafes") refresh();
+      } else if (msg.type === "trading_config") refresh();
+      else if (msg.type === "ledger" || msg.type === "failsafes") refresh();
     };
     ws.onclose = () => setTimeout(connectWs, 2000);
   }
