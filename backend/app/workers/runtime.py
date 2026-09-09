@@ -121,16 +121,12 @@ class AutonomyRuntime:
                     )
                     continue
 
-                snippets: list[str] = []
-                try:
-                    boot = await self._wm.bootstrap()
-                    snippets.extend(self._snippets_from_bootstrap(boot))
-                except Exception as exc:
-                    logger.warning("bootstrap failed: %s", exc)
+                snippets = await self._wm.collect_intel_snippets()
+                if not snippets:
                     if self.state.settings.worldmap_required:
                         self.state.set_worldmap_ready(
                             False,
-                            f"WorldMap liveness OK but bootstrap failed: {exc}",
+                            "WorldMap is up but returned no usable intel payloads yet.",
                         )
                         self.state.wheel_nodes = []
                         self.state.edges = []
@@ -142,9 +138,8 @@ class AutonomyRuntime:
                             }
                         )
                         continue
-                    snippets.append("WorldMap bootstrap unavailable")
 
-                # WorldMap is healthy + bootstrap usable
+                # WorldMap sidecar healthy + intel available
                 was_down = not self.state.worldmap_ready
                 self.state.set_worldmap_ready(True)
                 if was_down and self.state.worldmap_paused_autonomy:

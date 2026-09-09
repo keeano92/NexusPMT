@@ -92,62 +92,85 @@ async def container_status(name: str) -> dict[str, Any]:
     }
 
 
+DEPENDENCY_CONTAINERS = (
+    "sk-ai-redis",
+    "sk-ai-redis-rest",
+    "sk-ai-ais-relay",
+)
+
+
+async def _start_named(name: str) -> dict[str, Any]:
+    client = _socket_client()
+    if client is not None:
+        try:
+            async with client as c:
+                r = await c.post(f"/containers/{name}/start")
+                if r.status_code in (204, 304):
+                    return {"name": name, "ok": True, "via": "engine_api"}
+        except Exception as exc:
+            logger.debug("engine start %s failed: %s", name, exc)
+    code, out, err = await _run(["docker", "start", name], timeout=90)
+    return {"name": name, "ok": code == 0, "via": "cli", "stdout": out, "stderr": err, "code": code}
+
+
 async def start_worldmap(container_name: str, compose_project: str) -> dict[str, Any]:
-    """Force-start WorldMap: Engine API start, then docker CLI / compose fallback."""
+    """Force-start WorldMap app + redis/relay dependencies."""
     if not await docker_available():
         return {
             "ok": False,
             "action": "none",
             "error": (
                 "Docker is not available to NexusPMT. Start WorldMap manually "
-                f"(`docker start {container_name}`), then click RECHECK."
+                f"(`docker start {container_name}` plus redis/relay), then click RECHECK."
             ),
         }
 
+    deps = []
+    for dep in DEPENDENCY_CONTAINERS:
+        deps.append(await _start_named(dep))
+
     before = await container_status(container_name)
     if before.get("running"):
-        return {"ok": True, "action": "already_running", "container": before}
+        return {
+            "ok": True,
+            "action": "already_running",
+            "container": before,
+            "dependencies": deps,
+        }
 
-    client = _socket_client()
-    if client is not None:
-        try:
-            async with client as c:
-                r = await c.post(f"/containers/{container_name}/start")
-                # 204 No Content = started; 304 = already started
-                if r.status_code in (204, 304):
-                    after = await container_status(container_name)
-                    return {"ok": True, "action": "engine_api_start", "container": after}
-                err = r.text
-        except Exception as exc:
-            err = str(exc)
-    else:
-        err = "no docker socket"
-
-    code, out, cli_err = await _run(["docker", "start", container_name], timeout=90)
-    if code == 0:
+    app = await _start_named(container_name)
+    if app.get("ok"):
         after = await container_status(container_name)
-        return {"ok": True, "action": "docker_start", "stdout": out, "container": after}
+        return {
+            "ok": bool(after.get("running")),
+            "action": "docker_start_stack",
+            "container": after,
+            "dependencies": deps,
+            "app": app,
+        }
 
     code2, out2, err2 = await _run(
-        ["docker", "compose", "-p", compose_project, "up", "-d", "app"],
-        timeout=180,
+        ["docker", "compose", "-p", compose_project, "up", "-d"],
+        timeout=240,
     )
+    after = await container_status(container_name)
     if code2 == 0:
-        after = await container_status(container_name)
         return {
             "ok": bool(after.get("running")),
             "action": "compose_up",
             "stdout": out2,
             "stderr": err2,
             "container": after,
-            "prior_start_error": cli_err or err or out,
+            "dependencies": deps,
+            "app": app,
         }
 
     return {
         "ok": False,
         "action": "failed",
-        "error": err2 or cli_err or err or out2 or out or "unable to start WorldMap",
-        "docker_start": {"code": code, "stderr": cli_err, "stdout": out},
+        "error": err2 or app.get("stderr") or "unable to start WorldMap stack",
+        "app": app,
+        "dependencies": deps,
         "compose_up": {"code": code2, "stderr": err2, "stdout": out2},
         "container": before,
     }
