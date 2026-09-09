@@ -223,6 +223,27 @@ html, body {
 }
 .grid .deck.wide { grid-column: 1 / -1; }
 
+.terminal {
+  margin: 0 0 0.75rem;
+  padding: 0.65rem 0.75rem;
+  max-height: 220px;
+  overflow: auto;
+  background: #05070d;
+  border: 1px solid rgba(0, 229, 255, 0.25);
+  border-radius: 6px;
+  color: #39ff14;
+  font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  text-shadow: 0 0 6px rgba(57, 255, 20, 0.25);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.terminal .enter { color: #00e5ff; }
+.terminal .skip { color: #ffb000; }
+.terminal .error { color: #ff2bd6; }
+.terminal .scan { color: #8b9bb4; }
+
 .stream {
   max-height: 260px;
   overflow: auto;

@@ -115,6 +115,13 @@ class FailSafeController:
         with self._lock:
             self._error_streak = 0
 
+    def reset_equity_anchors(self, equity_cents: int | None = None) -> None:
+        """Clear day/peak anchors when switching demo↔prod books so PnL never bleeds."""
+        with self._lock:
+            self._day_start_equity_cents = equity_cents
+            self._peak_equity_cents = equity_cents
+            self._error_streak = 0
+
     def update_equity(self, equity_cents: int, actor: str = "system") -> FailSafeState | None:
         """Update equity marks; may auto-kill on loss/drawdown."""
         with self._lock:

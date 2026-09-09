@@ -63,7 +63,25 @@
     );
     if ($("selMode") && snap.trading_mode) $("selMode").value = snap.trading_mode;
     if ($("selEnv") && snap.kalshi_env) $("selEnv").value = snap.kalshi_env;
+    if ($("bookTag")) $("bookTag").textContent = snap.book_key || `${snap.kalshi_env}:${snap.trading_mode}`;
     renderWorldmapGate(snap);
+  }
+
+  function colorizeTerminalLine(line) {
+    const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+    let cls = "scan";
+    if (/\bENTER\b/.test(line)) cls = "enter";
+    else if (/\bSKIP\b/.test(line)) cls = "skip";
+    else if (/\bERROR\b|\bWARN\b/.test(line)) cls = "error";
+    return `<span class="${cls}">${esc(line)}</span>`;
+  }
+
+  function renderTerminal(lines) {
+    const el = $("oppTerminal");
+    if (!el) return;
+    const arr = lines || [];
+    el.innerHTML = arr.map(colorizeTerminalLine).join("\n") || '<span class="scan">waiting for Kalshi scan…</span>';
+    el.scrollTop = el.scrollHeight;
   }
 
   function renderWheel(nodes) {
@@ -90,23 +108,29 @@
     el.className = "daily" + (v < 0 ? " neg" : "");
   }
 
-  function renderEdges(edges, scannedAt) {
+  function renderEdges(edges, scannedAt, evaluations) {
     const body = $("edgeBody");
     body.innerHTML = "";
-    const list = edges || [];
+    const evals = evaluations || [];
+    const list = evals.length ? evals : (edges || []);
     if ($("oppHint")) {
       $("oppHint").textContent = list.length
-        ? `Wheel → edge scores · ${list.length} opportunities · auto-trade top picks${scannedAt ? " · " + scannedAt : ""}`
-        : "Waiting for Futures Wheel + Kalshi scan…";
+        ? `Kalshi → xAI+Wheel · ${list.length} scored · strong ENTER ≈ 90% book cash${scannedAt ? " · " + scannedAt : ""}`
+        : "Waiting for Kalshi opportunity scan…";
     }
     if (!list.length) {
-      body.innerHTML = "<tr><td colspan='6'>No fundamental edges yet</td></tr>";
+      body.innerHTML = "<tr><td colspan='6'>No evaluations yet</td></tr>";
       return;
     }
-    list.forEach((e) => {
+    list.slice(0, 40).forEach((e) => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${e.ticker}</td><td>${e.category || ""}</td><td>${(e.market_prob * 100).toFixed(1)}%</td>
-        <td>${(e.model_prob * 100).toFixed(1)}%</td><td>${(e.edge * 100).toFixed(1)}%</td><td>${e.action}</td>`;
+      const voi = e.value_of_interest != null ? (e.value_of_interest * 100).toFixed(0) + "%" : "—";
+      const mkt = e.market_prob != null ? (e.market_prob * 100).toFixed(1) + "%" : "—";
+      const model = e.model_prob != null ? (e.model_prob * 100).toFixed(1) + "%" : "—";
+      const edge = e.edge != null ? (e.edge * 100).toFixed(1) + "%" : "—";
+      const verdict = e.verdict || e.action || "—";
+      tr.innerHTML = `<td>${e.ticker || ""}</td><td>${voi}</td><td>${mkt}</td>
+        <td>${model}</td><td>${edge}</td><td>${verdict}</td>`;
       body.appendChild(tr);
     });
   }
@@ -194,7 +218,8 @@
     renderPills(snap);
     renderDaily(snap);
     renderWheel(snap.wheel);
-    renderEdges(snap.edges);
+    renderEdges(snap.edges, null, snap.evaluations);
+    renderTerminal(snap.terminal);
     renderLedger(snap.ledger);
     renderPortfolio(snap);
     pnlData = snap.pnl || {};
@@ -282,8 +307,17 @@
         pnlData = msg.pnl || pnlData;
         updateChart();
       } else if (msg.type === "wheel") renderWheel(msg.nodes);
-      else if (msg.type === "edges") renderEdges(msg.edges, msg.scanned_at);
-      else if (msg.type === "portfolio") refresh();
+      else if (msg.type === "edges") renderEdges(msg.edges, msg.scanned_at, msg.evaluations);
+      else if (msg.type === "terminal") {
+        if (msg.terminal) renderTerminal(msg.terminal);
+        else if (msg.line) {
+          const el = $("oppTerminal");
+          if (el) {
+            el.innerHTML += (el.innerHTML ? "\n" : "") + colorizeTerminalLine(msg.line);
+            el.scrollTop = el.scrollHeight;
+          }
+        }
+      } else if (msg.type === "portfolio") refresh();
       else if (msg.type === "worldmap") {
         if (msg.worldmap_ready === false || msg.worldmap_ready === true) {
           refresh();

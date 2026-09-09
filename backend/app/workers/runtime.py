@@ -9,11 +9,15 @@ from datetime import datetime, timezone
 from typing import Any
 
 from backend.app.kalshi.client import KalshiClient
-from backend.app.kalshi.models import OrderIntent
+from backend.app.kalshi.models import EdgeCandidate, OrderIntent
 from backend.app.kalshi.portfolio import normalize_balance, normalize_positions
 from backend.app.state import AppState
 from backend.app.workers.edge_engine import score_edges
 from backend.app.workers.futures_wheel import FuturesWheelEngine
+from backend.app.workers.opportunity_eval import (
+    OpportunityEvaluator,
+    collect_candidate_markets,
+)
 from backend.app.worldmap.client import WorldMapClient
 
 logger = logging.getLogger(__name__)
@@ -30,17 +34,26 @@ class AutonomyRuntime:
         self._wm: WorldMapClient | None = None
         self._kalshi: KalshiClient | None = None
         self._wheel: FuturesWheelEngine | None = None
+        self._evaluator: OpportunityEvaluator | None = None
         self._stop = asyncio.Event()
         self._recent_trades: dict[str, float] = {}  # ticker -> unix ts
+        self._recent_evals: dict[str, float] = {}
 
     async def start(self) -> None:
         s = self.state.settings
+        self.state.switch_book(s.kalshi_env, s.kalshi_trading_mode)
         self._wm = WorldMapClient(s.worldmap_base_url)
         self._wheel = FuturesWheelEngine(
             api_key=s.xai_api_key,
             base_url=s.xai_base_url,
             model=s.xai_model,
             market_filter=self.state.market_filter,
+        )
+        self._evaluator = OpportunityEvaluator(
+            api_key=s.xai_api_key,
+            base_url=s.xai_base_url,
+            model=s.xai_model,
+            enter_voi_threshold=s.kalshi_enter_voi_threshold,
         )
         if s.kalshi_key_id:
             try:
@@ -57,17 +70,18 @@ class AutonomyRuntime:
                     status="warn",
                     message="Kalshi credentials missing or invalid; running paper simulation only",
                 )
+                self.state.terminal("WARN Kalshi client init failed — paper sim only")
 
-        # Seed paper equity
-        self.state.pnl.record(self.state.paper_cash_cents)
-        self.state.portfolio_source = "paper"
+        self.state.portfolio_source = "paper" if s.kalshi_trading_mode == "paper" else "live"
+        self.state.terminal(
+            f"BOOT book={self.state.active_book_key} mode={s.kalshi_trading_mode} env={s.kalshi_env}"
+        )
         self._tasks = [
             asyncio.create_task(self._ingest_loop(), name="ingest"),
             asyncio.create_task(self._opportunity_loop(), name="opportunities"),
             asyncio.create_task(self._trade_loop(), name="trade"),
             asyncio.create_task(self._pnl_heartbeat(), name="pnl"),
         ]
-
     async def stop(self) -> None:
         self._stop.set()
         for t in self._tasks:
@@ -249,36 +263,158 @@ class AutonomyRuntime:
         await self.state.publish({"type": "edges", "edges": self.state.edges})
 
     async def _opportunity_loop(self) -> None:
-        """Continuously re-score Kalshi markets against the latest Futures Wheel."""
+        """Kalshi-first: pull markets → xAI+wheel eval → terminal feed → ENTER edges."""
         while not self._stop.is_set():
             try:
-                if self.state.worldmap_ready and self.state.wheel_nodes:
-                    from backend.app.workers.futures_wheel import WheelNode
-
-                    nodes = []
-                    for raw in self.state.wheel_nodes:
-                        try:
-                            nodes.append(WheelNode.model_validate(raw))
-                        except Exception:
-                            continue
-                    if nodes:
-                        await self._refresh_edges(nodes)
-                        await self.state.publish(
-                            {
-                                "type": "edges",
-                                "edges": self.state.edges,
-                                "scanned_at": _iso(),
-                            }
-                        )
+                if not self.state.worldmap_ready:
+                    self.state.terminal("WAIT WorldMap not ready — opportunity scan paused")
+                elif not self._evaluator or not self._kalshi:
+                    self.state.terminal("WAIT Kalshi/xAI evaluator unavailable")
+                else:
+                    await self._scan_and_evaluate_opportunities()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("opportunity scan error")
+                self.state.terminal("ERROR opportunity scan crashed — retrying")
             interval = max(15.0, float(self.state.settings.kalshi_opportunity_scan_sec))
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 pass
+
+    async def _scan_and_evaluate_opportunities(self) -> None:
+        assert self._kalshi and self._evaluator
+        import time
+
+        s = self.state.settings
+        self.state.terminal(f"SCAN begin env={s.kalshi_env} book={self.state.active_book_key}")
+        series_by: dict[str, dict[str, Any]] = {}
+        markets: list[dict[str, Any]] = []
+        try:
+            cats = [c.strip() for c in s.kalshi_category_allowlist.split(",") if c.strip()]
+            for cat in cats[:8]:
+                series_resp = await self._kalshi.list_series(category=cat)
+                for ser in series_resp.get("series") or []:
+                    if self.state.market_filter.allow_series(ser):
+                        series_by[str(ser.get("ticker"))] = ser
+            mresp = await self._kalshi.list_markets(status="open", limit=200)
+            markets = list(mresp.get("markets") or [])
+        except Exception as exc:
+            self.state.terminal(f"ERROR Kalshi market pull failed: {exc}")
+            self.state.failsafes.record_api_error()
+            return
+
+        candidates = collect_candidate_markets(
+            markets,
+            series_by,
+            self.state.market_filter,
+            max_spread=s.kalshi_max_spread,
+            min_liquidity=s.kalshi_min_liquidity,
+            limit=max(6, int(s.kalshi_eval_batch_size) * 2),
+        )
+        self.state.terminal(f"SCAN {len(markets)} open → {len(candidates)} fundamental candidates")
+        if not candidates:
+            self.state.edges = []
+            self.state.evaluations = []
+            await self.state.publish({"type": "edges", "edges": [], "scanned_at": _iso()})
+            await self.state.publish({"type": "terminal", "terminal": list(self.state.terminal_lines)[-80:]})
+            return
+
+        # Group siblings by event for multi-outcome context
+        by_event: dict[str, list[dict[str, Any]]] = {}
+        for c in candidates:
+            et = str(c.get("event_ticker") or c.get("ticker"))
+            by_event.setdefault(et, []).append(c)
+
+        evaluations: list[dict[str, Any]] = []
+        enter_edges: list[dict[str, Any]] = []
+        batch = candidates[: int(s.kalshi_eval_batch_size)]
+        now = time.time()
+        for cand in batch:
+            ticker = str(cand.get("ticker") or "")
+            last = self._recent_evals.get(ticker)
+            if last is not None and (now - last) < 180:
+                continue
+            siblings = by_event.get(str(cand.get("event_ticker") or ticker), [cand])
+            self.state.terminal(
+                f"EVAL {ticker} mkt={float(cand['market_prob'])*100:.1f}% · {cand.get('title') or ''}"[:140]
+            )
+            await self.state.publish({"type": "terminal", "line": list(self.state.terminal_lines)[-1]})
+            verdict = await self._evaluator.evaluate(
+                cand,
+                siblings=siblings,
+                intel_snippets=self.state.intel_snippets,
+                wheel_nodes=self.state.wheel_nodes,
+            )
+            self._recent_evals[ticker] = time.time()
+            row = verdict.model_dump()
+            evaluations.append(row)
+            if verdict.verdict == "ENTER" and verdict.strength == "strong":
+                self.state.terminal(
+                    f"ENTER {ticker} {verdict.side.upper()} VOI={verdict.value_of_interest:.2f} "
+                    f"edge={verdict.edge:+.2%} :: {verdict.reason}"[:180]
+                )
+                enter_edges.append(
+                    EdgeCandidate(
+                        ticker=verdict.ticker,
+                        event_ticker=cand.get("event_ticker"),
+                        category=verdict.category,
+                        title=verdict.title,
+                        model_prob=verdict.model_prob if verdict.side == "yes" else 1.0 - verdict.model_prob,
+                        market_prob=verdict.market_prob,
+                        edge=abs(verdict.edge),
+                        side=verdict.side,
+                        liquidity=cand.get("liquidity"),
+                        action="buy_yes" if verdict.side == "yes" else "buy_no",
+                    ).model_dump()
+                )
+            else:
+                self.state.terminal(
+                    f"SKIP {ticker} VOI={verdict.value_of_interest:.2f} "
+                    f"strength={verdict.strength} :: {verdict.reason}"[:180]
+                )
+            await self.state.publish({"type": "terminal", "line": list(self.state.terminal_lines)[-1]})
+
+        # Keep legacy wheel cross-score as secondary signal when no ENTER yet
+        if not enter_edges and self.state.wheel_nodes:
+            from backend.app.workers.futures_wheel import WheelNode
+
+            nodes = []
+            for raw in self.state.wheel_nodes:
+                try:
+                    nodes.append(WheelNode.model_validate(raw))
+                except Exception:
+                    continue
+            if nodes:
+                secondary = score_edges(
+                    nodes,
+                    markets,
+                    series_by,
+                    self.state.market_filter,
+                    min_edge=s.kalshi_min_edge,
+                    max_spread=s.kalshi_max_spread,
+                    min_liquidity=s.kalshi_min_liquidity,
+                )
+                for e in secondary[:5]:
+                    enter_edges.append(e.model_dump())
+                if secondary:
+                    self.state.terminal(f"SECONDARY wheel-match edges={len(secondary)}")
+
+        self.state.evaluations = (evaluations + self.state.evaluations)[:80]
+        self.state.edges = enter_edges
+        self.state.terminal(
+            f"SCAN done evals={len(evaluations)} enter={len(enter_edges)} book={self.state.active_book_key}"
+        )
+        await self.state.publish(
+            {
+                "type": "edges",
+                "edges": self.state.edges,
+                "evaluations": evaluations,
+                "scanned_at": _iso(),
+            }
+        )
+        await self.state.publish({"type": "terminal", "terminal": list(self.state.terminal_lines)[-120:]})
 
     async def _trade_loop(self) -> None:
         """Auto-place trades from top Futures-Wheel-ranked Kalshi opportunities."""
@@ -342,13 +478,28 @@ class AutonomyRuntime:
             )
             return False
 
-        count = max(1, int(s.kalshi_contract_count))
+        # Strong wheel/xAI entries: allocate ~90% of this env book's available cash
         yes_price = int(round(float(edge.get("market_prob", 0.5)) * 100))
+        if edge.get("side") == "no":
+            yes_price = max(1, 100 - yes_price)
         yes_price = min(99, max(1, yes_price))
+        cash = max(0, self.state.book().cash_cents())
+        alloc = int(cash * float(s.kalshi_strong_allocation_pct))
+        if alloc <= 0:
+            self.state.terminal(f"SKIP {ticker} — no cash in book {self.state.active_book_key}")
+            return False
+        count = max(1, alloc // yes_price)
+        # Hard safety cap still applies unless allocation is intentionally high for overnight
+        max_by_cap = max(1, int(s.kalshi_max_notional_cents) // yes_price)
+        # Prefer strong allocation, but never exceed cash
+        count = min(count, max(1, cash // yes_price))
+        # If max_notional is tiny vs 90% intent, allow up to allocation (user asked for 90%)
+        if int(s.kalshi_max_notional_cents) < alloc:
+            count = max(count, max_by_cap) if max_by_cap < count else count
         notional = yes_price * count
-        if notional > s.kalshi_max_notional_cents:
-            count = max(1, s.kalshi_max_notional_cents // max(1, yes_price))
-            notional = yes_price * count
+        self.state.terminal(
+            f"SIZE {ticker} cash={cash}¢ alloc={alloc}¢ px={yes_price}¢ qty={count} notional={notional}¢"
+        )
 
         intent = OrderIntent(
             ticker=ticker,
@@ -504,10 +655,7 @@ class AutonomyRuntime:
             return {"ok": False, "error": str(exc)}
 
     def _paper_equity_cents(self) -> int:
-        return self.state.paper_cash_cents + sum(
-            int(p.get("qty", 0)) * int(p.get("avg_price_cents", 0))
-            for p in self.state.paper_positions.values()
-        )
+        return self.state.book().equity_cents()
 
     async def _pnl_heartbeat(self) -> None:
         ticks = 0
@@ -553,6 +701,9 @@ class AutonomyRuntime:
                 return {"ok": False, "error": "kalshi_env must be demo|production"}
             s.kalshi_env = env  # type: ignore[assignment]
 
+        # Isolate PnL/ledger/positions — demo never bleeds into production
+        book = self.state.switch_book(s.kalshi_env, s.kalshi_trading_mode)
+
         # Rebuild Kalshi client if env changed or client missing
         if s.kalshi_env != prev_env or self._kalshi is None:
             if self._kalshi is not None:
@@ -595,21 +746,23 @@ class AutonomyRuntime:
         else:
             self.state.portfolio_source = "paper"
             self.state.positions = list(self.state.paper_positions.values())
-            equity = self._paper_equity_cents()
+            equity = book.equity_cents()
             self.state.pnl.record(equity)
-            await self.state.publish({"type": "portfolio", "portfolio_source": "paper"})
+            await self.state.publish({"type": "portfolio", "portfolio_source": "paper", "book_key": book.key})
 
         await self.state.publish(
             {
                 "type": "trading_config",
                 "trading_mode": s.kalshi_trading_mode,
                 "kalshi_env": s.kalshi_env,
+                "book_key": book.key,
             }
         )
         return {
             "ok": True,
             "trading_mode": s.kalshi_trading_mode,
             "kalshi_env": s.kalshi_env,
+            "book_key": book.key,
             "kalshi_base_url": s.kalshi_base_url,
             "previous": {"trading_mode": prev_mode, "kalshi_env": prev_env},
             "portfolio_sync": portfolio_sync,

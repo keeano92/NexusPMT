@@ -70,7 +70,7 @@
 
   <section class="pnl deck">
     <div class="pnl-head">
-      <h2>PnL COMMAND</h2>
+      <h2>PnL COMMAND <span class="tag" id="bookTag">demo:paper</span></h2>
       <div class="daily" id="dailyPnl">$0.00</div>
     </div>
     <div class="horizon-tabs" id="horizonTabs">
@@ -92,13 +92,14 @@
       <div id="wheelStream" class="stream"></div>
     </section>
     <section class="deck">
-      <h2>KALSHI OPPORTUNITIES <span class="tag" id="oppLiveTag">LIVE FEED</span></h2>
-      <p class="hint" id="oppHint">Wheel → edge scores · auto-trade picks top opportunities</p>
+      <h2>KALSHI OPS TERMINAL <span class="tag" id="oppLiveTag">LIVE</span></h2>
+      <p class="hint" id="oppHint">Kalshi → xAI + Futures Wheel → ENTER/SKIP · strong gets ~90% book cash</p>
+      <pre id="oppTerminal" class="terminal" aria-live="polite"></pre>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>Ticker</th><th>Cat</th><th>Mkt</th><th>Model</th><th>Edge</th><th>Action</th>
+              <th>Ticker</th><th>VOI</th><th>Mkt</th><th>Model</th><th>Edge</th><th>Verdict</th>
             </tr>
           </thead>
           <tbody id="edgeBody"></tbody>

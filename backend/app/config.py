@@ -67,17 +67,20 @@ class Settings(BaseSettings):
     )
     kalshi_min_edge: float = Field(default=0.05, alias="KALSHI_MIN_EDGE")
     kalshi_max_spread: float = Field(default=0.08, alias="KALSHI_MAX_SPREAD")
-    kalshi_min_liquidity: float = Field(default=100.0, alias="KALSHI_MIN_LIQUIDITY")
+    kalshi_min_liquidity: float = Field(default=0.0, alias="KALSHI_MIN_LIQUIDITY")
     kalshi_max_notional_cents: int = Field(default=2500, alias="KALSHI_MAX_NOTIONAL_CENTS")
     kalshi_max_open_positions: int = Field(default=10, alias="KALSHI_MAX_OPEN_POSITIONS")
     kalshi_require_approval_above_cents: int = Field(
-        default=1000,
+        default=50000,
         alias="KALSHI_REQUIRE_APPROVAL_ABOVE_CENTS",
     )
     kalshi_trade_interval_sec: float = Field(default=20.0, alias="KALSHI_TRADE_INTERVAL_SEC")
     kalshi_max_trades_per_cycle: int = Field(default=3, alias="KALSHI_MAX_TRADES_PER_CYCLE")
     kalshi_opportunity_scan_sec: float = Field(default=45.0, alias="KALSHI_OPPORTUNITY_SCAN_SEC")
     kalshi_contract_count: int = Field(default=1, alias="KALSHI_CONTRACT_COUNT")
+    kalshi_strong_allocation_pct: float = Field(default=0.90, alias="KALSHI_STRONG_ALLOCATION_PCT")
+    kalshi_enter_voi_threshold: float = Field(default=0.65, alias="KALSHI_ENTER_VOI_THRESHOLD")
+    kalshi_eval_batch_size: int = Field(default=6, alias="KALSHI_EVAL_BATCH_SIZE")
 
     xai_api_key: str = Field(default="", alias="XAI_API_KEY")
     xai_base_url: str = Field(default="https://api.x.ai/v1", alias="XAI_BASE_URL")
