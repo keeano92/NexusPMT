@@ -443,16 +443,18 @@ class AutonomyRuntime:
 
             # Prefer non-micro then higher volume; keep category diversity
             ranked_series.sort(key=_series_rank_key)
-            # Pin longer-horizon crypto series so volume giants (PRES/FED) don't
-            # push the only funded-shard tradeables out of the pull window.
-            pinned = [
-                ser
-                for ser in ranked_series
-                if any(
-                    tag in str(ser.get("ticker") or "").upper()
-                    for tag in ("MAXMON", "MINMON", "MAXY", "MINY", "MAX150")
-                )
-            ]
+            # Pin the active lane so PRES/FED volume giants don't crowd it out.
+            if prefer_15m:
+                pinned = [ser for ser in ranked_series if _is_micro_horizon(ser)]
+            else:
+                pinned = [
+                    ser
+                    for ser in ranked_series
+                    if any(
+                        tag in str(ser.get("ticker") or "").upper()
+                        for tag in ("MAXMON", "MINMON", "MAXY", "MINY", "MAX150")
+                    )
+                ]
             pull_series: list[dict[str, Any]] = []
             seen_series: set[str] = set()
             for ser in pinned + ranked_series:
