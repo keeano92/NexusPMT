@@ -114,14 +114,27 @@
 
   function renderDaily(snap) {
     const el = $("dailyPnl");
-    const v = snap.session_pnl_cents != null ? snap.session_pnl_cents : (snap.daily_pnl_cents || 0);
+    const paper = snap.paper;
+    const usingPaper = (snap.trading_mode || "paper") === "paper" && paper;
+    const v = usingPaper
+      ? (paper.session_pnl_cents || 0)
+      : snap.session_pnl_cents != null
+        ? snap.session_pnl_cents
+        : (snap.daily_pnl_cents || 0);
     el.textContent = money(v);
     el.className = "daily" + (v < 0 ? " neg" : "");
     const line = $("pnlEquityLine");
     if (line) {
-      const eq = snap.equity_cents != null ? money(snap.equity_cents) : money(snap.live_equity_cents || snap.cash_cents || 0);
-      const cash = money(snap.cash_cents != null ? snap.cash_cents : snap.paper_cash_cents);
-      line.textContent = `Equity ${eq} · Cash ${cash} · Source ${(snap.portfolio_source || "paper").toUpperCase()} · Book ${snap.book_key || "—"}`;
+      if (usingPaper) {
+        line.textContent =
+          `Paper equity ${money(paper.equity_cents)} · Cash ${money(paper.cash_cents)} · ` +
+          `W/L ${paper.wins || 0}/${paper.losses || 0} · Peak ${money(paper.peak_cents)} · ` +
+          `DD ${(paper.drawdown_pct || 0).toFixed(1)}% · Gate ${money(paper.target_cents)}`;
+      } else {
+        const eq = snap.equity_cents != null ? money(snap.equity_cents) : money(snap.live_equity_cents || snap.cash_cents || 0);
+        const cash = money(snap.cash_cents != null ? snap.cash_cents : snap.paper_cash_cents);
+        line.textContent = `Equity ${eq} · Cash ${cash} · Source ${(snap.portfolio_source || "paper").toUpperCase()} · Book ${snap.book_key || "—"}`;
+      }
     }
     const halt = $("haltBanner");
     if (halt) {
@@ -295,7 +308,13 @@
     renderTerminal(snap.terminal);
     renderLedger(snap.ledger);
     renderPortfolio(snap);
-    pnlData = snap.pnl || {};
+    // Paper mode: chart shadow-book equity, not the unused live PnL store
+    if ((snap.trading_mode || "paper") === "paper" && snap.paper && snap.paper.pnl) {
+      const curve = snap.paper.pnl;
+      pnlData = { rt: curve, paper: curve, "5m": curve, "1h": curve };
+    } else {
+      pnlData = snap.pnl || {};
+    }
     updateChart();
     $("lastIngest").textContent = snap.last_ingest_ts || "—";
   }

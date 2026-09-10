@@ -49,15 +49,31 @@ class PaperShadowBook:
     losses: int = 0
     realized_pnl_cents: int = 0
     series_cooldown_until: dict[str, float] = field(default_factory=dict)
+    # Equity curve for UI charts: [{ts, equity_cents}, ...]
+    equity_points: list[dict[str, float]] = field(default_factory=list)
 
     @classmethod
     def create(cls, start_cents: int = 1000, target_cents: int = 10000) -> PaperShadowBook:
-        return cls(
+        book = cls(
             start_cents=start_cents,
             target_cents=target_cents,
             cash_cents=start_cents,
             peak_cents=start_cents,
         )
+        book._record_equity(force=True)
+        return book
+
+    def _record_equity(self, force: bool = False) -> None:
+        now = time.time()
+        eq = float(self.equity_cents())
+        if not force and self.equity_points:
+            last = self.equity_points[-1]
+            # Throttle: ≥5s or ≥1¢ change
+            if now - float(last["ts"]) < 5 and abs(eq - float(last["equity_cents"])) < 1:
+                return
+        self.equity_points.append({"ts": now, "equity_cents": eq})
+        if len(self.equity_points) > 2000:
+            self.equity_points = self.equity_points[-1500:]
 
     def equity_cents(self) -> int:
         eq = self.cash_cents
@@ -154,6 +170,7 @@ class PaperShadowBook:
             reason="paper open vs live book",
         )
         self.fills.append(fill)
+        self._record_equity(force=True)
         return fill
 
     def update_mark(self, ticker: str, yes_mid: float) -> None:
@@ -164,6 +181,7 @@ class PaperShadowBook:
         eq = self.equity_cents()
         if eq > self.peak_cents:
             self.peak_cents = eq
+        self._record_equity()
 
     def close_position(
         self,
@@ -220,7 +238,37 @@ class PaperShadowBook:
         eq = self.equity_cents()
         if eq > self.peak_cents:
             self.peak_cents = eq
+        self._record_equity(force=True)
         return fill
+
+    def pnl_series(self) -> dict[str, Any]:
+        """Shape compatible with frontend chart (same as PnLSeriesStore horizon)."""
+        pts = list(self.equity_points) or [
+            {"ts": time.time(), "equity_cents": float(self.equity_cents())}
+        ]
+        equities = [float(p["equity_cents"]) for p in pts]
+        first = equities[0]
+        last = equities[-1]
+        change = last - first
+        change_pct = (change / first * 100.0) if first else 0.0
+        return {
+            "horizon": "paper",
+            "points": [
+                {
+                    "ts": float(p["ts"]),
+                    "equity_cents": int(p["equity_cents"]),
+                    "realized_pnl_cents": 0,
+                    "unrealized_pnl_cents": 0,
+                }
+                for p in pts
+            ],
+            "change_cents": int(change),
+            "change_pct": round(change_pct, 2),
+            "high_cents": int(max(equities)),
+            "low_cents": int(min(equities)),
+            "last_cents": int(last),
+            "daily_pnl_cents": self.session_pnl_cents(),
+        }
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -238,6 +286,8 @@ class PaperShadowBook:
             "realized_pnl_cents": self.realized_pnl_cents,
             "positions": [asdict(p) for p in self.positions.values()],
             "fills_tail": [asdict(f) for f in self.fills[-40:]],
+            "equity_points": self.equity_points[-500:],
+            "pnl": self.pnl_series(),
             "gate_ready": self.unlocked_for_live(),
         }
 
@@ -255,6 +305,7 @@ class PaperShadowBook:
             "realized_pnl_cents": self.realized_pnl_cents,
             "positions": {k: asdict(v) for k, v in self.positions.items()},
             "fills": [asdict(f) for f in self.fills[-500:]],
+            "equity_points": self.equity_points[-2000:],
             "series_cooldown_until": self.series_cooldown_until,
         }
         p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -280,4 +331,19 @@ class PaperShadowBook:
             book.positions[str(t)] = PaperPosition(**pdata)
         for f in raw.get("fills") or []:
             book.fills.append(PaperFill(**f))
+        for pt in raw.get("equity_points") or []:
+            book.equity_points.append(
+                {"ts": float(pt["ts"]), "equity_cents": float(pt["equity_cents"])}
+            )
+        if not book.equity_points:
+            # Rebuild a coarse curve from fills so charts aren't empty after upgrade
+            book.equity_points.append(
+                {"ts": time.time() - 3600, "equity_cents": float(book.start_cents)}
+            )
+            running = float(book.start_cents)
+            for f in book.fills:
+                if f.kind == "close":
+                    running += float(f.pnl_cents)
+                    book.equity_points.append({"ts": float(f.ts), "equity_cents": running})
+            book._record_equity(force=True)
         return book
